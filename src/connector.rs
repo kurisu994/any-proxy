@@ -10,6 +10,7 @@
 //!
 //! M0 默认关闭上游连接池，每次请求都走一次完整的 resolve → validate → dial。
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -100,8 +101,6 @@ where
         })
     }
 }
-
-use std::collections::HashSet;
 
 /// 建立的连接
 #[derive(Debug, Clone)]
@@ -287,6 +286,34 @@ mod tests {
         let result = connector.connect(&make_target(443)).await;
         assert!(result.is_err());
         assert!(dialer.dial_records().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_connects_no_cross_mapping() {
+        let resolver = FakeResolver::new(vec!["1.2.3.4".parse().unwrap()]);
+        let policy = AddressPolicy::new();
+        let dialer = FakeDialer::new();
+        let connector = Arc::new(Connector::new(resolver, policy, dialer.clone()));
+
+        let t1 = make_target(443);
+        let t2 = make_target(8443);
+        let t3 = make_target(8080);
+        let (r1, r2, r3) = tokio::join!(
+            connector.connect(&t1),
+            connector.connect(&t2),
+            connector.connect(&t3),
+        );
+
+        assert_eq!(r1.unwrap().peer_addr.port(), 443);
+        assert_eq!(r2.unwrap().peer_addr.port(), 8443);
+        assert_eq!(r3.unwrap().peer_addr.port(), 8080);
+
+        let records = dialer.dial_records();
+        assert_eq!(records.len(), 3);
+        for port in [443, 8443, 8080] {
+            let expected: SocketAddr = format!("1.2.3.4:{}", port).parse().unwrap();
+            assert!(records.contains(&expected));
+        }
     }
 
     #[tokio::test]

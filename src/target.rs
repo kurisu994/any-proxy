@@ -202,6 +202,20 @@ fn parse_host(host_str: &str) -> Result<Host, crate::ProxyError> {
     Ok(Host::Domain(trimmed.to_string()))
 }
 
+impl Target {
+    /// 返回 authority 字符串（host + 非默认端口）
+    ///
+    /// 默认端口（HTTP 80 / HTTPS 443）省略，用于重定向环检测和 Location 拼接。
+    pub fn authority(&self) -> String {
+        let port_str = if self.port == self.scheme.default_port() {
+            String::new()
+        } else {
+            format!(":{}", self.port)
+        };
+        format!("{}{}", self.host, port_str)
+    }
+}
+
 /// 主机名的规范化形式（用于 DNS 查询、Host header 和 TLS SNI）
 ///
 /// 对域名返回小写形式；对 IP 返回标准字符串表示。

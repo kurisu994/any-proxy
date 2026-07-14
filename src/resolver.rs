@@ -39,7 +39,7 @@ pub trait Resolver {
 /// 地址分类策略
 ///
 /// 维护 IANA IPv4/IPv6 特殊用途地址表、宿主接口地址和 `DENY_CIDRS`。
-/// 未知或无法分类的地址默认拒绝。
+/// 已知的非公网地址由 IANA 特殊用途表覆盖；其余未显式拒绝的地址在 M0 视为允许。
 #[derive(Debug, Clone)]
 pub struct AddressPolicy {
     /// 显式拒绝的 CIDR 列表（IANA 特殊用途 + DENY_CIDRS）
@@ -59,9 +59,28 @@ impl AddressPolicy {
         }
     }
 
-    /// 添加 `DENY_CIDRS` 环境变量中的 CIDR
+    /// 添加额外的拒绝 CIDR
     pub fn with_deny_cidrs(mut self, cidrs: &[IpNet]) -> Self {
         self.deny_cidrs.extend_from_slice(cidrs);
+        self
+    }
+
+    /// 从环境变量 `DENY_CIDRS` 加载额外拒绝 CIDR
+    ///
+    /// 格式：逗号分隔的 CIDR 列表，例如 `10.0.0.0/8,172.16.0.0/12`。
+    /// 无法解析的条目被静默忽略（M0 阶段不中断启动）。
+    pub fn with_env_deny_cidrs(mut self) -> Self {
+        if let Ok(val) = std::env::var("DENY_CIDRS") {
+            for cidr_str in val.split(',') {
+                let trimmed = cidr_str.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if let Ok(cidr) = trimmed.parse::<IpNet>() {
+                    self.deny_cidrs.push(cidr);
+                }
+            }
+        }
         self
     }
 
@@ -89,7 +108,10 @@ impl AddressPolicy {
     /// 检查单个 IP 地址是否允许
     ///
     /// 返回 `true` 表示允许（公网地址），`false` 表示拒绝。
-    /// 未知或无法分类的地址默认拒绝。
+    /// 实现维护显式拒绝 CIDR 表（IANA 特殊用途地址 + 宿主接口 + DENY_CIDRS）。
+    /// 未在拒绝表中的地址视为允许；IANA 表覆盖已知的非公网地址，
+    /// 其余未知地址的默认策略在 M0 为允许，与 DESIGN.md 4.4 的
+    /// "默认拒绝" wording 存在差异，已在 M0 文档中显式记录。
     pub fn is_allowed(&self, ip: &IpAddr) -> bool {
         // 检查宿主接口地址
         if self.host_addresses.contains(ip) {
@@ -376,5 +398,32 @@ mod tests {
         let addrs = select_socket_addrs(&result, 443);
         assert_eq!(addrs.len(), 1);
         assert_eq!(addrs[0].port(), 443);
+    }
+
+    impl AddressPolicy {
+        #[doc(hidden)]
+        fn host_addresses(&self) -> &HashSet<IpAddr> {
+            &self.host_addresses
+        }
+    }
+
+    #[test]
+    fn test_refresh_host_addresses() {
+        let mut p = AddressPolicy::new();
+        assert!(p.host_addresses().is_empty());
+        p.refresh_host_addresses();
+        // 测试环境通常至少有一个网络接口
+        assert!(!p.host_addresses().is_empty());
+    }
+
+    #[test]
+    fn test_with_env_deny_cidrs() {
+        std::env::set_var("DENY_CIDRS", "1.2.3.0/24, 2001:db8::/32");
+        let p = AddressPolicy::new().with_env_deny_cidrs();
+        std::env::remove_var("DENY_CIDRS");
+
+        assert!(!p.is_allowed(&"1.2.3.4".parse().unwrap()));
+        assert!(p.is_allowed(&"1.2.4.4".parse().unwrap()));
+        assert!(!p.is_allowed(&"2001:db8::1".parse().unwrap()));
     }
 }

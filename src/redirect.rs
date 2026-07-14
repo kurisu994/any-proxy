@@ -15,7 +15,7 @@
 
 use std::collections::HashSet;
 
-use crate::target::{Host, Scheme, Target};
+use crate::target::{Scheme, Target};
 
 /// 重定向跟随决策
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,19 +169,7 @@ fn parse_location(location: &str, current: &Target) -> Result<Target, crate::Pro
     }
 
     // 相对 URL：按当前 URL 的 scheme + host + port 拼接
-    let scheme = current.scheme;
-    let port_str = if current.port == scheme.default_port() {
-        String::new()
-    } else {
-        format!(":{}", current.port)
-    };
-
-    let host_str = match &current.host {
-        Host::Domain(d) => d.clone(),
-        Host::Ip(ip) => ip.to_string(),
-    };
-
-    let absolute = format!("{scheme}://{host_str}{port_str}{location}");
+    let absolute = format!("{}://{}{}", current.scheme, current.authority(), location);
     crate::target::parse_target(&format!("/{absolute}"))
 }
 
@@ -194,12 +182,7 @@ fn is_cross_origin(a: &Target, b: &Target) -> bool {
 
 /// 生成 canonical URL 字符串（用于环检测）
 fn canonical_url(target: &Target) -> String {
-    let port_str = if target.port == target.scheme.default_port() {
-        String::new()
-    } else {
-        format!(":{}", target.port)
-    };
-    format!("{}://{}{}", target.scheme, target.host, port_str)
+    format!("{}://{}", target.scheme, target.authority())
 }
 
 #[cfg(test)]

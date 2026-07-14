@@ -10,9 +10,26 @@ keywords = ["proxy", "cors", "relay", "http"]
 categories = ["web-programming", "network-programming"]
 
 [dependencies]
+# === M0 核心依赖 ===
 # 异步 runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "io-util"] }
-# 入站 HTTP 服务器（M1 使用，M0 仅用于 spike 验证）
+# URL 解析
+url = "2"
+# CIDR 匹配
+ipnet = "2"
+# 宿主网络接口枚举
+if-addrs = "0.13"
+# Trait 变体（用于 Send trait 自动派生）
+trait-variant = "0.1"
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 结构化日志（M0 已预留接口，M1 接入）
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# === M1 完整 Relay 预留依赖（当前尚未在 M0 实现中使用） ===
+# 入站 HTTP 服务器
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 # 出站 HTTP/1.1 客户端
 hyper = { version = "1", features = ["client", "http1"] }
@@ -27,20 +44,6 @@ http-body-util = "0.1"
 futures-util = { version = "0.3", default-features = false }
 # 服务层
 tower = { version = "0.5", features = ["limit", "timeout", "util"] }
-# URL 解析
-url = "2"
-# CIDR 匹配
-ipnet = "2"
-# 宿主网络接口枚举
-if-addrs = "0.13"
-# 序列化
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-# 结构化日志
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-# Trait 变体（用于 Send trait 自动派生）
-trait-variant = "0.1"
 
 [dev-dependencies]
 # 测试用

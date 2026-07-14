@@ -217,38 +217,32 @@ async fn test_tls_cert_validation_failure() {
     let target = local_target(hostname, port);
     let conn = connector.connect(&target).await.expect("连接应成功");
 
-    // TLS 握手 — 使用空的 root store（不信任任何证书）
+    // 使用空的 root store 进行 TLS 握手，不信任自签名证书
     let tcp_stream = tokio::net::TcpStream::connect(conn.peer_addr)
         .await
         .expect("TCP 重连应成功");
 
-    let empty_config = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoCertVerifier))
-        .with_no_client_auth();
-    let tls_connector = TlsConnector::from(Arc::new(empty_config));
-    let domain = rustls::pki_types::ServerName::try_from(hostname).unwrap();
-
-    // 使用 NoCertVerifier 会使握手通过（dangerous 模式），
-    // 但用默认的 root store（不信任自签名证书）则应该失败
     let default_config = rustls::ClientConfig::builder()
         .with_root_certificates(rustls::RootCertStore::empty())
         .with_no_client_auth();
     let default_connector = TlsConnector::from(Arc::new(default_config));
+    let domain = rustls::pki_types::ServerName::try_from(hostname).unwrap();
 
-    let tcp_stream2 = tokio::net::TcpStream::connect(conn.peer_addr)
-        .await
-        .expect("TCP 重连应成功");
-    let result = default_connector.connect(domain, tcp_stream2).await;
-
+    let result = default_connector.connect(domain, tcp_stream).await;
     assert!(result.is_err(), "不信任的证书应导致 TLS 握手失败");
 
     // 清理：用 dangerous verifier 完成握手以正常关闭
-    let _ = tls_connector
-        .connect(
-            rustls::pki_types::ServerName::try_from(hostname).unwrap(),
-            tcp_stream,
-        )
+    let cleanup_stream = tokio::net::TcpStream::connect(conn.peer_addr)
+        .await
+        .expect("TCP 清理连接应成功");
+    let dangerous_config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoCertVerifier))
+        .with_no_client_auth();
+    let dangerous_connector = TlsConnector::from(Arc::new(dangerous_config));
+    let cleanup_domain = rustls::pki_types::ServerName::try_from(hostname).unwrap();
+    let _ = dangerous_connector
+        .connect(cleanup_domain, cleanup_stream)
         .await;
 
     server.shutdown();
