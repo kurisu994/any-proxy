@@ -71,7 +71,7 @@ impl AddressPolicy {
     /// 从环境变量 `DENY_CIDRS` 加载额外拒绝 CIDR
     ///
     /// 格式：逗号分隔的 CIDR 列表，例如 `10.0.0.0/8,172.16.0.0/12`。
-    /// 无法解析的条目被静默忽略（M0 阶段不中断启动）。
+    /// 无法解析的条目打印 warn 日志并跳过（不影响启动）。
     pub fn with_env_deny_cidrs(mut self) -> Self {
         if let Ok(val) = std::env::var("DENY_CIDRS") {
             for cidr_str in val.split(',') {
@@ -79,8 +79,15 @@ impl AddressPolicy {
                 if trimmed.is_empty() {
                     continue;
                 }
-                if let Ok(cidr) = trimmed.parse::<IpNet>() {
-                    self.deny_cidrs.push(cidr);
+                match trimmed.parse::<IpNet>() {
+                    Ok(cidr) => self.deny_cidrs.push(cidr),
+                    Err(e) => {
+                        tracing::warn!(
+                            cidr = trimmed,
+                            error = %e,
+                            "DENY_CIDRS 条目无效，已跳过"
+                        );
+                    }
                 }
             }
         }

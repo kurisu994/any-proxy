@@ -203,6 +203,36 @@ async fn test_tls_cert_validation_failure() {
     server.shutdown();
 }
 
+/// 测试 5: SNI 不匹配导致 TLS 握手失败
+///
+/// 服务器证书是 "localhost"，但客户端使用 "other.example.com" 作为 SNI。
+/// 即使信任该证书，SNI 不匹配也应导致握手失败。
+#[tokio::test]
+async fn test_tls_sni_mismatch_failure() {
+    let server_hostname = "localhost";
+    let server = fixture::TestServer::start_https(server_hostname).await;
+    let port = server.addr.port();
+    let cert_der = server
+        .cert_der
+        .clone()
+        .expect("HTTPS server should have cert");
+
+    let test_policy = AddressPolicy::allow_all_for_test();
+    let resolver = FakeResolverOne {
+        addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+    };
+    let dialer = TcpDialer::new();
+    let tls_config = fixture::test_tls_client_config(cert_der);
+    let connector = Connector::with_tls(resolver, test_policy, dialer, tls_config);
+
+    // 使用不匹配的 hostname 作为 SNI
+    let target = local_https_target("other.example.com", port);
+    let result = connector.connect(&target).await;
+    assert!(result.is_err(), "SNI 不匹配应导致 TLS 握手失败");
+
+    server.shutdown();
+}
+
 // === 测试辅助 ===
 
 /// 假 Resolver：总是返回同一个 IP

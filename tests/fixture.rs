@@ -22,6 +22,8 @@ pub struct TestServer {
     pub hostname: String,
     /// HTTPS 模式下的证书 DER（用于客户端 TLS 配置）
     pub cert_der: Option<Vec<u8>>,
+    /// 当前活跃连接数（chunked 服务器模式）
+    pub active_connections: Option<Arc<std::sync::atomic::AtomicUsize>>,
     join_handle: tokio::task::JoinHandle<()>,
 }
 
@@ -68,6 +70,7 @@ impl TestServer {
             addr,
             hostname: "localhost".to_string(),
             cert_der: None,
+            active_connections: None,
             join_handle,
         }
     }
@@ -76,6 +79,7 @@ impl TestServer {
     ///
     /// 总大小 = `chunk_size` * `chunk_count`，使用 chunked transfer encoding。
     /// 每个 chunk 之间有 `delay` 的延迟（用于测试 idle timeout 和取消传播）。
+    /// 返回的第二个值是当前活跃连接数的共享计数器。
     pub async fn start_http_chunked(
         chunk_size: usize,
         chunk_count: usize,
@@ -83,33 +87,50 @@ impl TestServer {
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
+        let active_clone = active.clone();
         let join_handle = tokio::spawn(async move {
             loop {
                 let (mut socket, _) = match listener.accept().await {
                     Ok(v) => v,
                     Err(_) => break,
                 };
+                active_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let active_clone2 = active_clone.clone();
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 4096];
                     let _ = socket.read(&mut buf).await;
 
                     // chunked transfer encoding header
                     let header = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
-                    let _ = socket.write_all(header.as_bytes()).await;
+                    if socket.write_all(header.as_bytes()).await.is_err() {
+                        active_clone2.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        return;
+                    }
 
                     let chunk_data = vec![b'A'; chunk_size];
                     for _ in 0..chunk_count {
                         let chunk_header = format!("{:X}\r\n", chunk_size);
-                        let _ = socket.write_all(chunk_header.as_bytes()).await;
-                        let _ = socket.write_all(&chunk_data).await;
-                        let _ = socket.write_all(b"\r\n").await;
+                        if socket.write_all(chunk_header.as_bytes()).await.is_err() {
+                            active_clone2.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                            return;
+                        }
+                        if socket.write_all(&chunk_data).await.is_err() {
+                            active_clone2.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                            return;
+                        }
+                        if socket.write_all(b"\r\n").await.is_err() {
+                            active_clone2.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                            return;
+                        }
                         if !delay.is_zero() {
                             tokio::time::sleep(delay).await;
                         }
                     }
                     // 结束 chunk
                     let _ = socket.write_all(b"0\r\n\r\n").await;
+                    active_clone2.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 });
             }
         });
@@ -119,6 +140,7 @@ impl TestServer {
             hostname: "localhost".to_string(),
             cert_der: None,
             join_handle,
+            active_connections: Some(active),
         }
     }
 
@@ -171,6 +193,7 @@ impl TestServer {
             addr,
             hostname: hostname.to_string(),
             cert_der: Some(cert_der),
+            active_connections: None,
             join_handle,
         }
     }

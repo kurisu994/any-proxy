@@ -94,9 +94,22 @@ pub fn build_method_not_allowed_response(request_id: &str) -> Response<Body> {
 }
 
 /// 构建 CORS 预检 204 No Content 响应
+///
+/// 保留旧接口（生成新 request_id），建议使用 `build_preflight_response_with_id`。
 pub fn build_preflight_response(
     request_method: Option<&str>,
     request_headers: Option<&str>,
+) -> Response<Body> {
+    build_preflight_response_with_id(request_method, request_headers, "")
+}
+
+/// 构建 CORS 预检 204 No Content 响应（带 request_id 关联）
+///
+/// 预检校验失败时使用传入的 request_id，确保日志可关联。
+pub fn build_preflight_response_with_id(
+    request_method: Option<&str>,
+    request_headers: Option<&str>,
+    request_id: &str,
 ) -> Response<Body> {
     match headers::build_preflight_headers(request_method, request_headers) {
         Ok(hdrs) => {
@@ -108,9 +121,13 @@ pub fn build_preflight_response(
             response
         }
         Err(err) => {
-            // 预检校验失败返回 400 + CORS
-            let request_id = crate::telemetry::generate_request_id();
-            let mut resp = build_error_response(&err, &request_id);
+            // 预检校验失败返回 400 + CORS，使用传入的 request_id
+            let id = if request_id.is_empty() {
+                crate::telemetry::generate_request_id()
+            } else {
+                request_id.to_string()
+            };
+            let mut resp = build_error_response(&err, &id);
             // 覆盖状态码为 400
             *resp.status_mut() = StatusCode::BAD_REQUEST;
             resp

@@ -1,7 +1,7 @@
 //! any-proxy — Rust 公网匿名 CORS Relay
 //!
-//! M0: 安全连接器 spike
-//! M1: 完整 Relay
+//! M0: 安全连接器 spike（已完成）
+//! M1: 完整 Relay（已完成）
 //!
 //! 模块结构：
 //! - [`config`] — 运行时配置：环境变量解析与校验

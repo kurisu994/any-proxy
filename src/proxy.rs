@@ -84,7 +84,7 @@ where
             },
             &request_id,
         );
-        log_complete(&request_id, &method, &resp, start);
+        log_complete(&request_id, &method, &resp, start, None);
         return resp;
     }
 
@@ -107,22 +107,23 @@ where
         "OPTIONS" => ProxyMethod::Options,
         _ => {
             let resp = error::build_method_not_allowed_response(&request_id);
-            log_complete(&request_id, &method, &resp, start);
+            log_complete(&request_id, &method, &resp, start, None);
             return resp;
         }
     };
 
     // OPTIONS 预检
     if proxy_method == ProxyMethod::Options {
-        let resp = error::build_preflight_response(
+        let resp = error::build_preflight_response_with_id(
             req_headers
                 .get("access-control-request-method")
                 .and_then(|v| v.to_str().ok()),
             req_headers
                 .get("access-control-request-headers")
                 .and_then(|v| v.to_str().ok()),
+            &request_id,
         );
-        log_complete(&request_id, &method, &resp, start);
+        log_complete(&request_id, &method, &resp, start, None);
         return resp;
     }
 
@@ -131,10 +132,13 @@ where
         Ok(t) => t,
         Err(e) => {
             let resp = error::build_error_response(&e, &request_id);
-            log_complete(&request_id, &method, &resp, start);
+            log_complete(&request_id, &method, &resp, start, None);
             return resp;
         }
     };
+
+    // 对上传 body 应用 idle timeout
+    let body = body_timeout::wrap_request_body(body, state.config.upload_idle_timeout);
 
     // 执行代理请求（含重定向跟随）
     let result = forward_request(
@@ -150,12 +154,18 @@ where
 
     match result {
         Ok(resp) => {
-            log_complete(&request_id, &method, &resp, start);
+            let error_code = if resp.status().is_server_error() {
+                Some("upstream_error")
+            } else {
+                None
+            };
+            log_complete(&request_id, &method, &resp, start, error_code);
             resp
         }
         Err(e) => {
+            let code = e.code();
             let resp = error::build_error_response(&e, &request_id);
-            log_complete(&request_id, &method, &resp, start);
+            log_complete(&request_id, &method, &resp, start, Some(code));
             resp
         }
     }
@@ -172,7 +182,7 @@ async fn forward_request<R, D>(
     http_method: http::Method,
     mut req_headers: http::HeaderMap,
     body: Body,
-    _request_id: &str,
+    request_id: &str,
 ) -> Result<Response, crate::ProxyError>
 where
     R: Resolver + 'static,
@@ -196,7 +206,13 @@ where
             headers::build_host_header(&current_target),
         );
 
-        // 建立 TCP(+TLS) 连接
+        tracing::debug!(
+            request_id = %request_id,
+            target = %current_target.full_url(),
+            "连接上游"
+        );
+
+        // 建立 TCP(+TLS) 连接（Connector 内部有各阶段超时）
         let conn = state.connector.connect(&current_target).await?;
 
         // 包装 stream 为 Hyper Io
@@ -210,9 +226,10 @@ where
                     message: format!("HTTP 握手失败: {e}"),
                 })?;
 
-        // 驱动连接
+        // 驱动连接（带连接池空闲超时，超时后自动关闭）
+        let pool_idle = state.config.pool_idle_timeout;
         tokio::spawn(async move {
-            let _ = connection.await;
+            let _ = tokio::time::timeout(pool_idle, connection).await;
         });
 
         // 构建上游请求
@@ -230,7 +247,7 @@ where
 
         *upstream_req.headers_mut() = cleaned_headers;
 
-        // 发送请求（带超时）
+        // 发送请求并等待响应 headers（带超时）
         let response = tokio::time::timeout(
             state.config.upstream_headers_timeout,
             sender.send_request(upstream_req),
@@ -263,6 +280,12 @@ where
                     if strip_authorization {
                         req_headers.remove(http::header::AUTHORIZATION);
                     }
+                    tracing::debug!(
+                        request_id = %request_id,
+                        status = status,
+                        new_target = %new_target.full_url(),
+                        "跟随重定向"
+                    );
                     current_target = new_target;
                     continue;
                 }
@@ -296,11 +319,15 @@ fn build_proxy_response(
 }
 
 /// 记录请求完成日志（隐私过滤）
+///
+/// 只记录 request_id、method、status、duration_ms 和可选的 error_code。
+/// 不记录 query、headers、cookie 或 body。
 fn log_complete(
     request_id: &str,
     method: &http::Method,
     response: &Response,
     start: std::time::Instant,
+    error_code: Option<&str>,
 ) {
     let status = response.status().as_u16();
     let duration = start.elapsed();
@@ -309,6 +336,7 @@ fn log_complete(
         request_id = %request_id,
         method = %method,
         status = status,
+        error_code = ?error_code,
         duration_ms = duration.as_millis() as u64,
         "request complete"
     );

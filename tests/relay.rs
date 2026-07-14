@@ -32,8 +32,7 @@ impl Resolver for LoopbackResolver {
 }
 
 /// 构建测试用的 Axum app
-fn make_test_app(fixture_port: u16) -> axum::Router {
-    let _ = fixture_port;
+fn make_test_app() -> axum::Router {
     let policy = AddressPolicy::allow_all_for_test();
     let connector = Arc::new(Connector::new(LoopbackResolver, policy, TcpDialer::new()));
     let config = Arc::new(Config::default());
@@ -41,8 +40,8 @@ fn make_test_app(fixture_port: u16) -> axum::Router {
 }
 
 /// 启动测试代理服务器，返回 (端口, 关闭句柄)
-async fn start_proxy(fixture_port: u16) -> (u16, tokio::task::JoinHandle<()>) {
-    let app = make_test_app(fixture_port);
+async fn start_proxy() -> (u16, tokio::task::JoinHandle<()>) {
+    let app = make_test_app();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let port = addr.port();
@@ -109,7 +108,7 @@ async fn http_method(port: u16, method: &str, path: &str) -> String {
 #[tokio::test]
 async fn test_healthz() {
     let server = fixture::TestServer::start_http().await;
-    let (port, _handle) = start_proxy(server.addr.port()).await;
+    let (port, _handle) = start_proxy().await;
 
     let resp = http_get(port, "/healthz").await;
     assert!(resp.contains("200 OK"), "healthz 应返回 200: {resp}");
@@ -122,7 +121,7 @@ async fn test_healthz() {
 #[tokio::test]
 async fn test_index_page() {
     let server = fixture::TestServer::start_http().await;
-    let (port, _handle) = start_proxy(server.addr.port()).await;
+    let (port, _handle) = start_proxy().await;
 
     let resp = http_get(port, "/").await;
     assert!(resp.contains("200 OK"), "首页应返回 200: {resp}");
@@ -141,7 +140,7 @@ async fn test_proxy_http_get() {
 
     // 构建 proxy 请求路径
     let proxy_path = format!("/http://127.0.0.1:{port}/");
-    let (proxy_port, _handle) = start_proxy(port).await;
+    let (proxy_port, _handle) = start_proxy().await;
 
     let resp = http_get(proxy_port, &proxy_path).await;
     assert!(resp.contains("200 OK"), "代理应返回 200: {resp}");
@@ -158,7 +157,7 @@ async fn test_cors_headers_in_response() {
     let server = fixture::TestServer::start_http().await;
     let port = server.addr.port();
     let proxy_path = format!("/http://127.0.0.1:{port}/");
-    let (proxy_port, _handle) = start_proxy(port).await;
+    let (proxy_port, _handle) = start_proxy().await;
 
     let resp = http_get(proxy_port, &proxy_path).await;
     assert!(
@@ -181,7 +180,7 @@ async fn test_options_preflight() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let server = fixture::TestServer::start_http().await;
     let port = server.addr.port();
-    let (proxy_port, _handle) = start_proxy(port).await;
+    let (proxy_port, _handle) = start_proxy().await;
 
     let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
         .await
@@ -225,8 +224,7 @@ async fn test_options_preflight() {
 #[tokio::test]
 async fn test_method_not_allowed() {
     let server = fixture::TestServer::start_http().await;
-    let port = server.addr.port();
-    let (proxy_port, _handle) = start_proxy(port).await;
+    let (proxy_port, _handle) = start_proxy().await;
 
     let resp = http_method(proxy_port, "TRACE", "/http://example.com/").await;
     assert!(resp.contains("405"), "TRACE 应返回 405: {resp}");
@@ -246,7 +244,7 @@ async fn test_upstream_4xx_passthrough() {
     let server = fixture::TestServer::start_http_with_status(404).await;
     let port = server.addr.port();
     let proxy_path = format!("/http://127.0.0.1:{port}/");
-    let (proxy_port, _handle) = start_proxy(port).await;
+    let (proxy_port, _handle) = start_proxy().await;
 
     let resp = http_get(proxy_port, &proxy_path).await;
     assert!(resp.contains("404"), "应原样转发 404: {resp}");
@@ -262,7 +260,7 @@ async fn test_head_request() {
     let server = fixture::TestServer::start_http().await;
     let port = server.addr.port();
     let proxy_path = format!("/http://127.0.0.1:{port}/");
-    let (proxy_port, _handle) = start_proxy(port).await;
+    let (proxy_port, _handle) = start_proxy().await;
 
     let resp = http_method(proxy_port, "HEAD", &proxy_path).await;
     assert!(resp.contains("200"), "HEAD 应返回 200: {resp}");
@@ -274,7 +272,7 @@ async fn test_head_request() {
 #[tokio::test]
 async fn test_invalid_target_url() {
     let server = fixture::TestServer::start_http().await;
-    let (proxy_port, _handle) = start_proxy(server.addr.port()).await;
+    let (proxy_port, _handle) = start_proxy().await;
 
     let resp = http_get(proxy_port, "/ftp://example.com/").await;
     assert!(resp.contains("400"), "非法协议应返回 400: {resp}");
@@ -332,7 +330,7 @@ async fn test_streaming_256mib() {
             .await;
     let port = server.addr.port();
     let proxy_path = format!("/http://127.0.0.1:{port}/");
-    let (proxy_port, _handle) = start_proxy(port).await;
+    let (proxy_port, _handle) = start_proxy().await;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
@@ -377,19 +375,15 @@ async fn test_streaming_256mib() {
 ///
 /// 上游服务器以慢速 chunked 响应（每 chunk 间隔 100ms），
 /// 客户端在读取第一个 chunk 后主动断开，
-/// 验证上游服务器不会无限继续发送（连接被关闭）。
+/// 验证上游服务器的活跃连接数在断开后减少。
 #[tokio::test]
 async fn test_client_disconnect_cancels_upstream() {
-    // 慢速响应：每 100ms 发送一个 1KB chunk
-    let server = fixture::TestServer::start_http_chunked(
-        1024,
-        1000, // 1000 chunks * 100ms = 100s total if not cancelled
-        std::time::Duration::from_millis(100),
-    )
-    .await;
+    let server =
+        fixture::TestServer::start_http_chunked(1024, 1000, std::time::Duration::from_millis(100))
+            .await;
     let port = server.addr.port();
     let proxy_path = format!("/http://127.0.0.1:{port}/");
-    let (proxy_port, _handle) = start_proxy(port).await;
+    let (proxy_port, _handle) = start_proxy().await;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", proxy_port))
@@ -406,15 +400,30 @@ async fn test_client_disconnect_cancels_upstream() {
     let mut buf = vec![0u8; 4096];
     let _ = stream.read(&mut buf).await.expect("应读到一些数据");
 
+    // 验证此时上游有活跃连接
+    let active = server
+        .active_connections
+        .as_ref()
+        .unwrap()
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert!(active > 0, "断开前上游应有活跃连接");
+
     // 客户端主动断开
     drop(stream);
 
-    // 等待一小段时间让取消传播
+    // 等待取消传播
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-    // 如果取消传播正常工作，上游服务器的连接应该已被关闭。
-    // 我们无法直接检查上游连接状态，但测试不挂起就说明取消传播在工作。
-    // 如果没有取消传播，上游会继续发送 1000 个 chunk（100 秒），测试会超时。
+    // 验证上游活跃连接数减少（取消传播生效）
+    let active_after = server
+        .active_connections
+        .as_ref()
+        .unwrap()
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        active_after < active,
+        "断开后活跃连接数应减少: {active_after} < {active}"
+    );
 
     server.shutdown();
 }

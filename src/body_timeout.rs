@@ -9,6 +9,7 @@
 //! 超时后 Body 返回错误，Hyper/Axum 会中止流并关闭连接，
 //! 调用方看到截断 Body，日志记录 `stream_aborted`。
 
+use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -17,13 +18,13 @@ use http_body::Body as HttpBody;
 
 /// 包装一个 `HttpBody`，在读取每个 frame 时应用 idle timeout
 ///
-/// 每次 `poll_data` 成功后重置计时器；如果两次 frame 间空闲超过 `timeout`，
-/// 返回 `std::io::ErrorKind::TimedOut`。
+/// 使用 `tokio::time::Sleep`（Box::pin）注册定时器 waker，确保即使 inner body
+/// 永久不产生数据，timeout 也能在指定时间后触发。
 pub struct IdleTimeoutBody<B> {
     inner: B,
     timeout: Duration,
-    /// 上一次成功读取 frame 的时间
-    last_frame: Option<std::time::Instant>,
+    /// 定时器：到期后唤醒 poll_frame 检查超时
+    sleep: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
 impl<B> IdleTimeoutBody<B> {
@@ -32,15 +33,19 @@ impl<B> IdleTimeoutBody<B> {
         Self {
             inner,
             timeout,
-            last_frame: None,
+            sleep: None,
         }
+    }
+
+    /// 启动或重置定时器
+    fn reset_sleep(&mut self) {
+        self.sleep = Some(Box::pin(tokio::time::sleep(self.timeout)));
     }
 }
 
 impl<B> HttpBody for IdleTimeoutBody<B>
 where
     B: HttpBody + Unpin,
-    B::Data: Send + 'static,
     B::Error: std::fmt::Debug + Send + 'static,
 {
     type Data = B::Data;
@@ -52,15 +57,19 @@ where
     ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
 
-        // 检查 idle timeout
-        if let Some(last) = this.last_frame {
-            let elapsed = std::time::Instant::now().duration_since(last);
-            if elapsed >= this.timeout {
+        // 首次调用时启动定时器
+        if this.sleep.is_none() {
+            this.reset_sleep();
+        }
+
+        // 1. 先检查定时器是否到期
+        if let Some(sleep) = &mut this.sleep {
+            if sleep.as_mut().poll(cx).is_ready() {
                 tracing::warn!(
                     timeout_ms = this.timeout.as_millis() as u64,
-                    elapsed_ms = elapsed.as_millis() as u64,
                     "body idle timeout，中止流"
                 );
+                crate::telemetry::log_stream_aborted("unknown", "body_idle_timeout", 0);
                 return Poll::Ready(Some(Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     "body idle timeout",
@@ -68,11 +77,11 @@ where
             }
         }
 
-        // 轮询内部 body
+        // 2. 轮询内部 body
         match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
-                // 成功读取 frame，重置计时器
-                this.last_frame = Some(std::time::Instant::now());
+                // 成功读取 frame，重置定时器
+                this.reset_sleep();
                 Poll::Ready(Some(Ok(frame)))
             }
             Poll::Ready(Some(Err(e))) => {
@@ -80,7 +89,11 @@ where
                 Poll::Ready(Some(Err(std::io::Error::other("body frame error"))))
             }
             Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
+            Poll::Pending => {
+                // inner 还没数据，定时器已在上面注册了 waker
+                // 当定时器到期或 inner 有数据时都会被唤醒
+                Poll::Pending
+            }
         }
     }
 }
@@ -89,6 +102,15 @@ where
 ///
 /// 使用 `UPSTREAM_BODY_IDLE_TIMEOUT` 配置。
 pub fn wrap_response_body(body: hyper::body::Incoming, timeout: Duration) -> axum::body::Body {
+    use http_body_util::BodyExt;
+    let wrapped = IdleTimeoutBody::new(body, timeout);
+    axum::body::Body::new(wrapped.map_err(axum::Error::new))
+}
+
+/// 将 idle timeout 应用于上传请求 body，返回 Axum `Body`
+///
+/// 使用 `UPLOAD_IDLE_TIMEOUT` 配置。
+pub fn wrap_request_body(body: axum::body::Body, timeout: Duration) -> axum::body::Body {
     use http_body_util::BodyExt;
     let wrapped = IdleTimeoutBody::new(body, timeout);
     axum::body::Body::new(wrapped.map_err(axum::Error::new))

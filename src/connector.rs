@@ -17,9 +17,33 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use crate::resolver::{AddressPolicy, Resolver};
 use crate::target::{canonical_host, Target};
+
+/// 连接各阶段超时配置
+///
+/// 参见 DESIGN.md Section 6。所有阶段超时后返回 `ProxyError::ConnectTimeout`。
+#[derive(Debug, Clone, Copy)]
+pub struct ConnectTimeouts {
+    /// DNS 解析超时
+    pub dns: Duration,
+    /// TCP 连接超时
+    pub connect: Duration,
+    /// TLS 握手超时
+    pub tls: Duration,
+}
+
+impl Default for ConnectTimeouts {
+    fn default() -> Self {
+        Self {
+            dns: Duration::from_secs(5),
+            connect: Duration::from_secs(10),
+            tls: Duration::from_secs(10),
+        }
+    }
+}
 
 /// 包装任意 AsyncRead + AsyncWrite stream 为可 trait-object 的类型
 ///
@@ -111,6 +135,8 @@ pub struct Connector<R, D> {
     dialer: Arc<D>,
     /// TLS 配置（HTTPS 目标使用），None 时不支持 HTTPS
     tls_config: Option<Arc<rustls::ClientConfig>>,
+    /// 连接各阶段超时
+    timeouts: ConnectTimeouts,
 }
 
 impl<R, D> Connector<R, D>
@@ -125,6 +151,7 @@ where
             policy: Arc::new(policy),
             dialer: Arc::new(dialer),
             tls_config: None,
+            timeouts: ConnectTimeouts::default(),
         }
     }
 
@@ -140,7 +167,14 @@ where
             policy: Arc::new(policy),
             dialer: Arc::new(dialer),
             tls_config: Some(tls_config),
+            timeouts: ConnectTimeouts::default(),
         }
+    }
+
+    /// 设置连接各阶段超时
+    pub fn with_timeouts(mut self, timeouts: ConnectTimeouts) -> Self {
+        self.timeouts = timeouts;
+        self
     }
 
     /// 安全连接：resolve → validate → select → dial → (TLS) → 记录 peer_addr
@@ -149,8 +183,13 @@ where
     /// 允许目标的实际 dial peer 必须属于同一次 Resolver 返回且完成全量校验的地址集合。
     /// HTTPS 目标在 TCP 连接建立后进行 TLS 握手，SNI 使用原始规范化 hostname。
     pub async fn connect(&self, target: &Target) -> Result<Connection, crate::ProxyError> {
-        // 1. 解析目标主机名
-        let resolve_result = self.resolver.resolve(&target.host.as_str()).await?;
+        // 1. 解析目标主机名（带 DNS 超时）
+        let resolve_result = tokio::time::timeout(
+            self.timeouts.dns,
+            self.resolver.resolve(&target.host.as_str()),
+        )
+        .await
+        .map_err(|_| crate::ProxyError::ConnectTimeout)??;
 
         // 2. 全量校验所有地址
         let validated = self.policy.validate_all(&resolve_result.addresses)?;
@@ -167,8 +206,10 @@ where
             });
         }
 
-        // 4. dial 到第一个验证过的地址
-        let dial_record = self.dialer.dial(addrs[0]).await?;
+        // 4. dial 到第一个验证过的地址（带 TCP 连接超时）
+        let dial_record = tokio::time::timeout(self.timeouts.connect, self.dialer.dial(addrs[0]))
+            .await
+            .map_err(|_| crate::ProxyError::ConnectTimeout)??;
 
         // 5. 验证 peer_addr 属于已验证集合
         let validated_set: HashSet<SocketAddr> = addrs.iter().copied().collect();
@@ -178,7 +219,7 @@ where
             });
         }
 
-        // 6. HTTPS 目标进行 TLS 握手
+        // 6. HTTPS 目标进行 TLS 握手（带 TLS 超时）
         let stream =
             if target.scheme.is_tls() {
                 let tls_config =
@@ -195,12 +236,15 @@ where
                     })?;
 
                 let tls_connector = tokio_rustls::TlsConnector::from(tls_config.clone());
-                let tls_stream = tls_connector
-                    .connect(server_name, dial_record.stream)
-                    .await
-                    .map_err(|e| crate::ProxyError::ConnectFailed {
-                        message: format!("TLS 握手失败: {e}"),
-                    })?;
+                let tls_stream = tokio::time::timeout(
+                    self.timeouts.tls,
+                    tls_connector.connect(server_name, dial_record.stream),
+                )
+                .await
+                .map_err(|_| crate::ProxyError::ConnectTimeout)?
+                .map_err(|e| crate::ProxyError::ConnectFailed {
+                    message: format!("TLS 握手失败: {e}"),
+                })?;
 
                 BoxStream::new(tls_stream)
             } else {
@@ -277,6 +321,7 @@ impl Dialer for TcpDialer {
 /// 创建生产用 TLS 配置
 ///
 /// 加载系统根证书，使用 ring 加密后端，不跳过证书校验。
+/// 如果系统根证书加载为空，打印错误并退出（不能"假活着"）。
 pub fn create_tls_config() -> Arc<rustls::ClientConfig> {
     let mut root_store = rustls::RootCertStore::empty();
 
@@ -285,8 +330,12 @@ pub fn create_tls_config() -> Arc<rustls::ClientConfig> {
         root_store.add(cert).ok();
     }
     if root_store.is_empty() {
-        tracing::warn!("系统根证书加载为空，HTTPS 证书校验可能失败");
+        tracing::error!("系统根证书加载为空，HTTPS 证书校验将全部失败");
+        eprintln!("错误: 系统根证书加载为空，无法验证 HTTPS 目标。请检查 CA 证书是否已安装。");
+        std::process::exit(1);
     }
+
+    tracing::info!(root_count = root_store.len(), "TLS 根证书已加载");
 
     Arc::new(
         rustls::ClientConfig::builder()
