@@ -1,17 +1,25 @@
 //! any-proxy — Rust 公网匿名 CORS Relay
 //!
 //! M0: 安全连接器 spike
+//! M1: 完整 Relay
 //!
 //! 模块结构：
+//! - [`config`] — 运行时配置：环境变量解析与校验
 //! - [`target`] — URL 解析、协议与端口校验
 //! - [`resolver`] — DNS 解析（含 CNAME 跟踪）、公网 IP 校验（AddressPolicy）
 //! - [`connector`] — 安全连接编排：resolve → validate → dial → 记录 peer_addr
 //! - [`redirect`] — 重定向状态机与逐跳复查
 
+pub mod app;
+pub mod config;
 pub mod connector;
+pub mod error;
+pub mod headers;
+pub mod proxy;
 pub mod redirect;
 pub mod resolver;
 pub mod target;
+pub mod telemetry;
 
 /// 代理错误码
 ///

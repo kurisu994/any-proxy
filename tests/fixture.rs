@@ -30,8 +30,19 @@ impl TestServer {
     ///
     /// 服务器返回固定的 "hello" 响应。
     pub async fn start_http() -> Self {
+        Self::start_http_with_status_and_body(200, "hello").await
+    }
+
+    /// 启动本地 HTTP 服务器，返回指定状态码
+    pub async fn start_http_with_status(status: u16) -> Self {
+        Self::start_http_with_status_and_body(status, "response").await
+    }
+
+    /// 启动本地 HTTP 服务器，返回指定状态码和 body
+    pub async fn start_http_with_status_and_body(status: u16, body: &str) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let body = body.to_string();
 
         let join_handle = tokio::spawn(async move {
             loop {
@@ -39,10 +50,15 @@ impl TestServer {
                     Ok(v) => v,
                     Err(_) => break,
                 };
+                let body = body.clone();
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 4096];
                     let _ = socket.read(&mut buf).await;
-                    let response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+                    let response = format!(
+                        "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
                     let _ = socket.write_all(response.as_bytes()).await;
                 });
             }

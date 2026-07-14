@@ -1,0 +1,18 @@
+services:
+  any-proxy:
+    build: .
+    image: any-proxy:latest
+    ports:
+      - "8080:8080"
+    environment:
+      - LISTEN_ADDR=0.0.0.0:8080
+      - RUST_LOG=info
+      - MAX_CONCURRENT_REQUESTS=256
+      - DENY_CIDRS=
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 3s
+      retries: 3
+    restart: unless-stopped

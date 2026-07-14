@@ -1,0 +1,123 @@
+//! 无敏感信息的结构化日志与指标
+//!
+//! 参见 DESIGN.md Section 9（Observability and privacy）。
+//!
+//! # 隐私规则
+//!
+//! 结构化日志只记录 `request_id`、方法、目标 scheme、规范化 hostname、端口、
+//! 最终状态、错误码、持续时间和流式字节计数。
+//!
+//! **不得记录**：URL query、userinfo、请求/响应 headers、Cookie、Authorization 或 Body。
+//! 日志中的 hostname 也应支持关闭。
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+/// 全局请求 ID 计数器
+static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// 进程启动时间（纳秒），用作 request_id 前缀
+static PROCESS_START_NS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// 生成唯一请求 ID
+///
+/// 格式：`{进程启动纳秒 hex}-{递增计数器 hex}`，如 `0192a3b4c5d6e7f8-0001`。
+pub fn generate_request_id() -> String {
+    let start_ns = *PROCESS_START_NS.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+    });
+    let counter = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{start_ns:016x}-{counter:04x}")
+}
+
+/// 初始化 tracing-subscriber
+///
+/// 使用 JSON 格式输出，通过 `RUST_LOG` 环境变量控制日志级别。
+/// 在测试环境中使用默认格式以便阅读。
+pub fn init_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_target(false)
+        .try_init();
+}
+
+/// 请求级别的结构化日志 span 参数
+///
+/// 只包含隐私安全的字段：method、scheme、host（可关闭）、port、request_id。
+/// **不包含** query、headers、Cookie、Authorization 或 Body。
+#[derive(Debug, Clone)]
+pub struct RequestLogFields<'a> {
+    pub request_id: &'a str,
+    pub method: &'a str,
+    pub scheme: &'a str,
+    pub host: &'a str,
+    pub port: u16,
+}
+
+/// 请求完成时的结构化日志
+///
+/// 记录最终状态、错误码、持续时间和流式字节计数。
+/// 所有字段经过隐私过滤，不含敏感信息。
+pub fn log_request_complete(
+    fields: &RequestLogFields,
+    status: u16,
+    error_code: Option<&str>,
+    duration: Duration,
+    bytes_sent: u64,
+    bytes_received: u64,
+) {
+    tracing::info!(
+        request_id = %fields.request_id,
+        method = %fields.method,
+        scheme = %fields.scheme,
+        host = %fields.host,
+        port = fields.port,
+        status = status,
+        error_code = ?error_code,
+        duration_ms = duration.as_millis() as u64,
+        bytes_sent = bytes_sent,
+        bytes_received = bytes_received,
+        "request complete"
+    );
+}
+
+/// 流式中止日志
+///
+/// 响应 headers 已发出后 Body 传输中止时记录。
+pub fn log_stream_aborted(request_id: &str, reason: &str, bytes_sent: u64) {
+    tracing::warn!(
+        request_id = %request_id,
+        reason = %reason,
+        bytes_sent = bytes_sent,
+        "stream aborted"
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_request_id_unique() {
+        let id1 = generate_request_id();
+        let id2 = generate_request_id();
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_request_id_format() {
+        let id = generate_request_id();
+        // 格式应为 16 位 hex - 4 位 hex
+        assert!(id.contains('-'));
+        let parts: Vec<&str> = id.split('-').collect();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].len(), 16);
+        assert_eq!(parts[1].len(), 4);
+    }
+}

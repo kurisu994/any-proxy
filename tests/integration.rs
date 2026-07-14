@@ -10,6 +10,8 @@ use any_proxy::connector::{Connector, TcpDialer};
 use any_proxy::resolver::{AddressPolicy, ResolveResult, Resolver};
 use any_proxy::target::{Host, Scheme, Target};
 
+use fixture::test_tls_client_config;
+
 /// 假 Resolver：返回预设的 loopback 地址
 struct LoopbackResolver;
 
@@ -44,6 +46,7 @@ async fn test_http_get_local_fixture() {
         scheme: Scheme::Http,
         host: Host::Domain("localhost".to_string()),
         port,
+        path: "/".into(),
         query: String::new(),
     };
 
@@ -55,22 +58,25 @@ async fn test_http_get_local_fixture() {
 
 /// 测试 2: HTTPS GET — 本地 HTTPS fixture
 ///
-/// Connector 建立 TCP 连接到本地 HTTPS 服务器，
-/// 验证 TCP 层连接可达（TLS 握手在 tls_spike.rs 中验证）。
+/// Connector 建立 TCP + TLS 连接到本地 HTTPS 服务器，
+/// 验证 peer_addr 正确且 TLS 握手成功。
 #[tokio::test]
 async fn test_https_get_local_fixture() {
     let server = fixture::TestServer::start_https("localhost").await;
     let port = server.addr.port();
+    let cert_der = server.cert_der.clone().expect("HTTPS fixture 应有证书");
 
     let resolver = LoopbackResolver;
     let policy = test_policy();
     let dialer = TcpDialer::new();
-    let connector = Connector::new(resolver, policy, dialer);
+    let tls_config = test_tls_client_config(cert_der);
+    let connector = Connector::with_tls(resolver, policy, dialer, tls_config);
 
     let target = Target {
         scheme: Scheme::Https,
         host: Host::Domain("localhost".to_string()),
         port,
+        path: "/".into(),
         query: String::new(),
     };
 
@@ -98,6 +104,7 @@ async fn test_redirect_chain_multiple_connects() {
         scheme: Scheme::Http,
         host: Host::Domain("first.example.com".to_string()),
         port: server1.addr.port(),
+        path: "/".into(),
         query: String::new(),
     };
     let conn1 = connector.connect(&target1).await.expect("第一跳应成功");
@@ -108,6 +115,7 @@ async fn test_redirect_chain_multiple_connects() {
         scheme: Scheme::Http,
         host: Host::Domain("second.example.com".to_string()),
         port: server2.addr.port(),
+        path: "/".into(),
         query: String::new(),
     };
     let conn2 = connector.connect(&target2).await.expect("第二跳应成功");

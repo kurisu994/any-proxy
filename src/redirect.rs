@@ -195,6 +195,7 @@ mod tests {
             scheme: Scheme::Https,
             host: Host::Domain(host.into()),
             port,
+            path: "/".into(),
             query: String::new(),
         }
     }
@@ -205,6 +206,7 @@ mod tests {
             scheme: Scheme::Http,
             host: Host::Domain(host.into()),
             port,
+            path: "/".into(),
             query: String::new(),
         }
     }

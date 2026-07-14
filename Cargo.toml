@@ -29,14 +29,17 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # === M1 完整 Relay 预留依赖（当前尚未在 M0 实现中使用） ===
+# HTTP 类型（HeaderMap, Request, Response 等）
+http = "1"
 # 入站 HTTP 服务器
-axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "original-uri"] }
 # 出站 HTTP/1.1 客户端
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "tokio"] }
 # TLS
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "logging"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-native-certs = "0.7"
 rustls-pemfile = "2"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 # Body 桥接

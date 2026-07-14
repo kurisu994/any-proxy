@@ -19,6 +19,8 @@ pub struct Target {
     pub host: Host,
     /// 显式端口（未指定时为 scheme 默认端口）
     pub port: u16,
+    /// URL 路径（含前导 `/`，根路径为 `/`）
+    pub path: String,
     /// 原始 query string（含前导 `?`，可能为空）
     pub query: String,
 }
@@ -161,12 +163,21 @@ pub fn parse_target(raw_path_and_query: &str) -> Result<Target, crate::ProxyErro
     // query 原样保留
     let query = parsed.query().map(|q| format!("?{q}")).unwrap_or_default();
 
+    // path 原样保留（url crate 默认去除尾部斜线，但非根路径保留）
+    let path = parsed.path().to_string();
+    let path = if path.is_empty() {
+        "/".to_string()
+    } else {
+        path
+    };
+
     // fragment 不会出现在 HTTP request-target 中，忽略
 
     Ok(Target {
         scheme,
         host,
         port,
+        path,
         query,
     })
 }
@@ -214,6 +225,25 @@ impl Target {
         };
         format!("{}{}", self.host, port_str)
     }
+
+    /// 返回 HTTP request-target（path + query）
+    ///
+    /// 用于发送给上游的 HTTP/1.1 请求行，如 `/data?city=shanghai`。
+    pub fn request_target(&self) -> String {
+        format!("{}{}", self.path, self.query)
+    }
+
+    /// 返回完整的规范化 URL（scheme://authority/path?query）
+    ///
+    /// 用于日志和调试，不含 userinfo 和 fragment。
+    pub fn full_url(&self) -> String {
+        format!(
+            "{}://{}{}",
+            self.scheme,
+            self.authority(),
+            self.request_target()
+        )
+    }
 }
 
 /// 主机名的规范化形式（用于 DNS 查询、Host header 和 TLS SNI）
@@ -236,6 +266,7 @@ mod tests {
         assert_eq!(target.scheme, Scheme::Https);
         assert_eq!(target.host, Host::Domain("example.com".into()));
         assert_eq!(target.port, 443);
+        assert_eq!(target.path, "/data");
         assert_eq!(target.query, "?city=shanghai");
     }
 
@@ -308,12 +339,14 @@ mod tests {
     #[test]
     fn test_query_preserved() {
         let target = parse_target("/https://example.com/path?a=1&b=2").unwrap();
+        assert_eq!(target.path, "/path");
         assert_eq!(target.query, "?a=1&b=2");
     }
 
     #[test]
     fn test_no_query() {
         let target = parse_target("/https://example.com/path").unwrap();
+        assert_eq!(target.path, "/path");
         assert_eq!(target.query, "");
     }
 
@@ -323,5 +356,17 @@ mod tests {
         assert_eq!(Scheme::Https.default_port(), 443);
         assert!(Scheme::Https.is_tls());
         assert!(!Scheme::Http.is_tls());
+    }
+
+    #[test]
+    fn test_request_target() {
+        let target = parse_target("/https://example.com/data?q=1").unwrap();
+        assert_eq!(target.request_target(), "/data?q=1");
+    }
+
+    #[test]
+    fn test_full_url() {
+        let target = parse_target("/https://example.com:8443/data?q=1").unwrap();
+        assert_eq!(target.full_url(), "https://example.com:8443/data?q=1");
     }
 }
