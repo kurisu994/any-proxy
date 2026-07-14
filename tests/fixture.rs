@@ -5,6 +5,8 @@
 //! DNS/Resolver/Dialer 均可注入，测试不依赖公网。
 
 #![allow(dead_code)]
+
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use rcgen::CertificateParams;
