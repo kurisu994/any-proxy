@@ -21,6 +21,7 @@ use axum::extract::{OriginalUri, State};
 use axum::response::Response;
 use http::request::Builder as RequestBuilder;
 
+use crate::body_timeout;
 use crate::config::Config;
 use crate::connector::{Connector, Dialer};
 use crate::error;
@@ -267,19 +268,20 @@ where
                 }
                 RedirectAction::PassThrough => {
                     // 原样返回 3xx
-                    return build_proxy_response(response);
+                    return build_proxy_response(response, &state.config);
                 }
             }
         }
 
         // 非重定向，返回响应
-        return build_proxy_response(response);
+        return build_proxy_response(response, &state.config);
     }
 }
 
-/// 构建代理响应：清理 headers + 添加 CORS + 转换 body
+/// 构建代理响应：清理 headers + 添加 CORS + 应用 idle timeout + 转换 body
 fn build_proxy_response(
     response: hyper::Response<hyper::body::Incoming>,
+    config: &Config,
 ) -> Result<Response, crate::ProxyError> {
     let (mut parts, body) = response.into_parts();
 
@@ -287,8 +289,8 @@ fn build_proxy_response(
     headers::clean_response_headers(&mut parts.headers);
     headers::add_cors_headers(&mut parts.headers);
 
-    // 转换 body：Hyper Incoming -> Axum Body
-    let axum_body = Body::new(body);
+    // 应用逐 frame idle timeout 到响应 body
+    let axum_body = body_timeout::wrap_response_body(body, config.upstream_body_idle_timeout);
 
     Ok(Response::from_parts(parts, axum_body))
 }

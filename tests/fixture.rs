@@ -72,6 +72,56 @@ impl TestServer {
         }
     }
 
+    /// 启动本地 HTTP 服务器，返回 chunked 流式大 body
+    ///
+    /// 总大小 = `chunk_size` * `chunk_count`，使用 chunked transfer encoding。
+    /// 每个 chunk 之间有 `delay` 的延迟（用于测试 idle timeout 和取消传播）。
+    pub async fn start_http_chunked(
+        chunk_size: usize,
+        chunk_count: usize,
+        delay: std::time::Duration,
+    ) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let join_handle = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let _ = socket.read(&mut buf).await;
+
+                    // chunked transfer encoding header
+                    let header = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+                    let _ = socket.write_all(header.as_bytes()).await;
+
+                    let chunk_data = vec![b'A'; chunk_size];
+                    for _ in 0..chunk_count {
+                        let chunk_header = format!("{:X}\r\n", chunk_size);
+                        let _ = socket.write_all(chunk_header.as_bytes()).await;
+                        let _ = socket.write_all(&chunk_data).await;
+                        let _ = socket.write_all(b"\r\n").await;
+                        if !delay.is_zero() {
+                            tokio::time::sleep(delay).await;
+                        }
+                    }
+                    // 结束 chunk
+                    let _ = socket.write_all(b"0\r\n\r\n").await;
+                });
+            }
+        });
+
+        Self {
+            addr,
+            hostname: "localhost".to_string(),
+            cert_der: None,
+            join_handle,
+        }
+    }
+
     /// 启动本地 HTTPS 服务器
     ///
     /// 使用自签名证书。`hostname` 用于 TLS SNI。

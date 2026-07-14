@@ -31,6 +31,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # === M1 完整 Relay 预留依赖（当前尚未在 M0 实现中使用） ===
 # HTTP 类型（HeaderMap, Request, Response 等）
 http = "1"
+# HTTP Body trait
+http-body = "1"
 # 入站 HTTP 服务器
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "original-uri"] }
 # 出站 HTTP/1.1 客户端
