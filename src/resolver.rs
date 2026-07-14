@@ -65,6 +65,17 @@ impl AddressPolicy {
         self
     }
 
+    /// 创建允许所有地址的策略（仅供测试使用）
+    ///
+    /// 不包含任何 deny CIDR 和宿主接口地址。
+    #[doc(hidden)]
+    pub fn allow_all_for_test() -> Self {
+        Self {
+            deny_cidrs: vec![],
+            host_addresses: HashSet::new(),
+        }
+    }
+
     /// 刷新宿主网络接口地址
     pub fn refresh_host_addresses(&mut self) {
         self.host_addresses.clear();
@@ -182,6 +193,65 @@ pub fn select_socket_addrs(resolve_result: &ResolveResult, port: u16) -> Vec<Soc
         .iter()
         .map(|ip| SocketAddr::new(*ip, port))
         .collect()
+}
+
+/// 系统 DNS 解析器
+///
+/// 使用 `tokio::net::lookup_host` 进行真实 DNS 解析。
+/// tokio 的 lookup_host 会自动跟踪 CNAME 链到最终 A/AAAA 记录。
+///
+/// 注意：lookup_host 返回的是 `SocketAddr`（含端口），我们提取 IP 地址。
+/// 端口使用传入的 `host:port` 格式，最终只取 IP。
+pub struct SystemResolver;
+
+impl SystemResolver {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for SystemResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Resolver for SystemResolver {
+    async fn resolve(&self, host: &str) -> Result<ResolveResult, crate::ProxyError> {
+        // IP literal 直接返回
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            return Ok(ResolveResult {
+                addresses: vec![ip],
+            });
+        }
+
+        // 域名：使用 tokio DNS 解析
+        // lookup_host 需要一个 host:port 格式，端口用 0 表示只关心 IP
+        let lookup = format!("{host}:0");
+        let addrs: Vec<SocketAddr> = tokio::net::lookup_host(lookup)
+            .await
+            .map_err(|e| crate::ProxyError::DnsFailed {
+                message: format!("DNS 解析失败: {e}"),
+            })?
+            .collect();
+
+        // 提取唯一 IP 地址（去重，保留 A 和 AAAA）
+        let mut ips: Vec<IpAddr> = Vec::new();
+        let mut seen: HashSet<IpAddr> = HashSet::new();
+        for addr in addrs {
+            if seen.insert(addr.ip()) {
+                ips.push(addr.ip());
+            }
+        }
+
+        if ips.is_empty() {
+            return Err(crate::ProxyError::DnsFailed {
+                message: "DNS 返回空答案".into(),
+            });
+        }
+
+        Ok(ResolveResult { addresses: ips })
+    }
 }
 
 #[cfg(test)]

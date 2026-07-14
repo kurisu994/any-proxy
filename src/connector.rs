@@ -112,6 +112,45 @@ pub struct Connection {
     pub target: Target,
 }
 
+/// 真实 TCP Dialer
+///
+/// 使用 `tokio::net::TcpStream::connect` 连接到固定 `SocketAddr`，
+/// 返回 TCP stream 和 peer_addr 记录。
+pub struct TcpDialer;
+
+impl TcpDialer {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for TcpDialer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Dialer for TcpDialer {
+    async fn dial(&self, addr: SocketAddr) -> Result<DialRecord, crate::ProxyError> {
+        let stream = tokio::net::TcpStream::connect(addr).await.map_err(|e| {
+            crate::ProxyError::ConnectFailed {
+                message: format!("TCP 连接失败: {e}"),
+            }
+        })?;
+
+        let peer_addr = stream
+            .peer_addr()
+            .map_err(|e| crate::ProxyError::ConnectFailed {
+                message: format!("获取 peer_addr 失败: {e}"),
+            })?;
+
+        // 丢弃 stream，M0 spike 只需要验证连接可达和 peer_addr
+        drop(stream);
+
+        Ok(DialRecord { peer_addr })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
