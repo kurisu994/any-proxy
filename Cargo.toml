@@ -5,6 +5,9 @@ edition = "2021"
 rust-version = "1.75"
 description = "Rust 公网匿名 CORS Relay — URL 前缀式 HTTP(S) 代理"
 license = "MIT"
+repository = "https://github.com/kurisu994/any-proxy"
+keywords = ["proxy", "cors", "relay", "http"]
+categories = ["web-programming", "network-programming"]
 
 [dependencies]
 # 异步 runtime

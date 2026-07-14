@@ -1,0 +1,34 @@
+# Rust 构建产物
+/target
+debug/
+*.swp
+*.swo
+
+# IDE
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+.fleet/
+
+# 环境变量与密钥
+.env
+.env.*
+!.env.example
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+*.pid
+
+# 覆盖率与性能分析
+tarpaulin-report.html
+cobertura.xml
+flamegraph.svg
+perf.data*
+
+# gstack 本地 artifact（不提交）
+.gstack/
