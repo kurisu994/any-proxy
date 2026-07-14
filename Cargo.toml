@@ -1,0 +1,50 @@
+[package]
+name = "any-proxy"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Rust 公网匿名 CORS Relay — URL 前缀式 HTTP(S) 代理"
+license = "MIT"
+
+[dependencies]
+# 异步 runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
+# 入站 HTTP 服务器（M1 使用，M0 仅用于 spike 验证）
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+# 出站 HTTP/1.1 客户端
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "tokio"] }
+# TLS
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "logging"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+# Body 桥接
+http-body-util = "0.1"
+futures-util = { version = "0.3", default-features = false }
+# 服务层
+tower = { version = "0.5", features = ["limit", "timeout", "util"] }
+# URL 解析
+url = "2"
+# CIDR 匹配
+ipnet = "2"
+# 宿主网络接口枚举
+if-addrs = "0.13"
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 结构化日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# Trait 变体（用于 Send trait 自动派生）
+trait-variant = "0.1"
+
+[dev-dependencies]
+# 测试用
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "test-util"] }
+rcgen = "0.13"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
