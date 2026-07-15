@@ -1,10 +1,16 @@
 # 活跃上下文
 
-更新时间：2026-07-14
+更新时间：2026-07-15
 
 ## 当前状态
 
-M1 完整 Relay 已实现并提交（`0e4cc1d`）。项目从 M0 的 library-only 安全内核升级为可运行的代理服务，包含 binary target、Axum Router、CORS/header 清理、流式 Body 桥接、配置系统、结构化日志、Docker 和 112 个测试。
+2026-07-15 对 DESIGN.md 跑了 /autoplan（CEO+Eng+DX 三相双声道，Claude+Codex）。评审确认安全内核与架构 CONFIRMED sound，但发现两个"声称完成实则未完成"的 M1 关键缺口，已当场修复并验证：
+- **E1（已修）**：`redirect.rs` 的 `canonical_url` 只用 scheme://authority，同源换路径重定向被误判为环返回 403，破坏 M1 重定向标准。改用 `full_url()`，补 2 个回归测试。
+- **D1（已修）**：Dockerfile/compose 健康检查用 `wget`，但 debian-slim 无 wget → 容器永久 unhealthy，破坏 M1 标准 7。新增 `any-proxy health-check` 子命令（无新依赖），运行时验证 healthy→0/unhealthy→1/`/healthz`→200。
+
+修复后 fmt/clippy 干净，118 测试全通过。
+
+M1 完整 Relay 已实现并提交（`0e4cc1d`）。项目从 M0 的 library-only 安全内核升级为可运行的代理服务，包含 binary target、Axum Router、CORS/header 清理、流式 Body 桥接、配置系统、结构化日志、Docker 和测试。
 
 M0 遗留的安全收口项已在 M1 开头完成：
 - AddressPolicy 从 fail-open 改为 fail-closed（IPv6 仅 `2000::/3`，IPv4 补全特殊用途 CIDR）。
@@ -38,11 +44,21 @@ M0 遗留的安全收口项已在 M1 开头完成：
 
 ## 下一步
 
-1. M2：多架构 Docker 镜像（Linux amd64 + arm64），CI 构建。
-2. M2：GitHub Release 附带二进制压缩包和 SHA-256 校验文件。
-3. M2：SBOM、provenance、`cargo deny` 许可证/安全公告检查。
-4. M2：Prometheus exporter、可选 Caddy Compose 示例。
-5. M2：容器启动测试和公开运维文档。
+/autoplan 最终门用户接受了 3 个 User Challenge（均 additive，不反转原始决策），M2 优先级据此调整：
+
+**先做（UC 落地 + 剩余 P1/P2 代码修正）：**
+1. C1（UC-1）：增加可选、默认关的安全带 ALLOW_ORIGINS/ALLOW_TARGETS/AUTH_TOKEN + 默认端口限 80/443，显式 `unsafe-open` 全开。
+2. C4（UC-3）：M2 前移 abuse kill-switch + 安全默认 + 5 分钟部署体验。
+3. D3：随仓库交付 `docker-compose.caddy.yml` + Caddyfile（TLS 是魔法时刻前置条件，不推迟到 M2）。
+4. D2：README 首屏写明"必须部署海外出口"前提。
+5. 剩余 P2 代码修正：E2（cfg 门控测试逃生口）、E3（RFC Location 解析）、E4（IPv6 authority 方括号）、E5（接线 max_http1_buffer/headers_count knob）、E6（Connector 读真实 peer_addr）、E7（refresh 失败保留旧快照）、E8（deny 6to4/Teredo）。
+
+**再做（原 M2，部分后置）：**
+6. C2（UC-2）：Cloudflare Worker/边缘部署模板 + README 形态对比。
+7. 多架构 Docker 镜像 + SHA-256 校验（保留）；SBOM/provenance/Prometheus 后置。
+8. E11：CI 增加 `cargo deny`/`cargo audit`。
+
+完整 21 项任务清单见 `DESIGN.md` 的 Implementation Tasks 与 `~/.gstack/projects/kurisu994-any-proxy/tasks-*.jsonl`。
 
 ## 阻塞与风险
 
