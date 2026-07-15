@@ -20,6 +20,13 @@ use any_proxy::telemetry;
 
 #[tokio::main]
 async fn main() {
+    // 0. health-check 子命令：容器健康检查用，避免依赖镜像内的 wget/curl
+    //    （debian-slim 不含 wget，DESIGN §11 要求运行镜像只有二进制 + CA 证书）。
+    //    连接本机 LISTEN_ADDR 端口发起 GET /healthz，200 则退出 0，否则退出 1。
+    if std::env::args().nth(1).as_deref() == Some("health-check") {
+        std::process::exit(run_health_check());
+    }
+
     // 1. 初始化 tracing
     telemetry::init_tracing();
 
@@ -101,6 +108,59 @@ async fn main() {
     }
 
     tracing::info!("any-proxy 已关闭");
+}
+
+/// 容器健康检查：连接本机监听端口发起一次 `GET /healthz`
+///
+/// 返回进程退出码：0 = 健康（响应行含 `200`），1 = 不健康。
+/// 使用阻塞式 std::net，不引入额外依赖，也不需要镜像内有 wget/curl。
+/// 监听地址通常是 `0.0.0.0:PORT`，客户端连接改用 `127.0.0.1:PORT`。
+fn run_health_check() -> i32 {
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::Duration;
+
+    // 从 LISTEN_ADDR 取端口，默认 8080
+    let listen = std::env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
+    let port = listen
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(8080);
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+
+    let timeout = Duration::from_secs(3);
+    let mut stream = match TcpStream::connect_timeout(&addr, timeout) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("health-check 连接 {addr} 失败: {e}");
+            return 1;
+        }
+    };
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+
+    let req = b"GET /healthz HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    if let Err(e) = stream.write_all(req) {
+        eprintln!("health-check 写入失败: {e}");
+        return 1;
+    }
+
+    let mut buf = Vec::new();
+    if let Err(e) = stream.read_to_end(&mut buf) {
+        eprintln!("health-check 读取失败: {e}");
+        return 1;
+    }
+
+    // 检查状态行是否为 200
+    let head = String::from_utf8_lossy(&buf);
+    let first_line = head.lines().next().unwrap_or("");
+    if first_line.contains(" 200") {
+        0
+    } else {
+        eprintln!("health-check 非 200 响应: {first_line}");
+        1
+    }
 }
 
 /// 优雅关闭信号处理

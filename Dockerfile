@@ -38,7 +38,9 @@ EXPOSE 8080
 ENV LISTEN_ADDR=0.0.0.0:8080
 ENV RUST_LOG=info
 
+# 用二进制自带的 health-check 子命令，避免依赖镜像内的 wget/curl
+# （debian-slim 不含 wget，旧的 wget 健康检查会让容器永久 unhealthy）。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=3s --retries=3 \
-    CMD wget -qO- http://localhost:8080/healthz || exit 1
+    CMD ["any-proxy", "health-check"]
 
 ENTRYPOINT ["any-proxy"]

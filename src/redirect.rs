@@ -181,8 +181,12 @@ fn is_cross_origin(a: &Target, b: &Target) -> bool {
 }
 
 /// 生成 canonical URL 字符串（用于环检测）
+///
+/// 必须包含 path 与 query：环检测的语义是"同一个完整 URL 被访问两次"，
+/// 而不是"同一个 origin 被访问两次"。只用 scheme://authority 会把同源换路径的
+/// 合法重定向（如 `/old` → `/new`、尾斜线归一化）误判为环并返回 403。
 fn canonical_url(target: &Target) -> String {
-    format!("{}://{}", target.scheme, target.authority())
+    target.full_url()
 }
 
 #[cfg(test)]
@@ -297,6 +301,47 @@ mod tests {
         // 第二跳：other.com -> example.com（环）
         let result = rm.handle_redirect(Method::Get, 301, Some("https://example.com/"), &target1);
         assert!(result.is_err());
+    }
+
+    /// E1 回归：同源换路径的重定向不能被误判为环
+    ///
+    /// proxy.rs 会先 visit 初始 target，随后 handle_redirect 再 visit 新 target。
+    /// 修复前 canonical_url 只含 scheme://authority，同源换路径会与初始 URL 撞 key，
+    /// 导致合法的 `/old` → `/new`、尾斜线归一化等重定向被误判为环返回 403。
+    #[test]
+    fn test_same_host_redirect_not_false_loop() {
+        let mut rm = RedirectMachine::new();
+        let initial = https_target("example.com", 443); // path "/"
+        rm.visit(&initial); // 模拟 proxy.rs:forward_request 的首次记录
+
+        let action = rm
+            .handle_redirect(Method::Get, 301, Some("https://example.com/new"), &initial)
+            .unwrap();
+        assert!(
+            matches!(action, RedirectAction::Follow { .. }),
+            "同源换路径的重定向应跟随，而不是被误判为环"
+        );
+    }
+
+    /// E1 回归：同源真环（回到已访问的完整 URL）仍必须被检测
+    #[test]
+    fn test_same_host_true_loop_detected() {
+        let mut rm = RedirectMachine::new();
+        let initial = https_target("example.com", 443); // path "/"
+        rm.visit(&initial);
+
+        // /  -> /page
+        let action = rm
+            .handle_redirect(Method::Get, 302, Some("https://example.com/page"), &initial)
+            .unwrap();
+        let page = match action {
+            RedirectAction::Follow { target, .. } => target,
+            _ => panic!("expected Follow"),
+        };
+
+        // /page -> /（回到初始完整 URL，构成环）
+        let result = rm.handle_redirect(Method::Get, 302, Some("https://example.com/"), &page);
+        assert!(result.is_err(), "回到已访问的完整 URL 应检测为环");
     }
 
     #[test]
