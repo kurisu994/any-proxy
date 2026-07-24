@@ -216,14 +216,20 @@ fn parse_host(host_str: &str) -> Result<Host, crate::ProxyError> {
 impl Target {
     /// 返回 authority 字符串（host + 非默认端口）
     ///
-    /// 默认端口（HTTP 80 / HTTPS 443）省略，用于重定向环检测和 Location 拼接。
+    /// 默认端口（HTTP 80 / HTTPS 443）省略，用于 Host header、重定向环检测和 Location 拼接。
+    /// IPv6 字面量按 RFC 3986 用方括号包裹（`[::1]`、`[2606:4700::1]:8443`），
+    /// 否则地址内的冒号会与端口分隔符混淆，Host header 与 URL 序列化都会畸形。
     pub fn authority(&self) -> String {
+        let host_str = match &self.host {
+            Host::Ip(IpAddr::V6(v6)) => format!("[{v6}]"),
+            other => other.to_string(),
+        };
         let port_str = if self.port == self.scheme.default_port() {
             String::new()
         } else {
             format!(":{}", self.port)
         };
-        format!("{}{}", self.host, port_str)
+        format!("{host_str}{port_str}")
     }
 
     /// 返回 HTTP request-target（path + query）
@@ -235,7 +241,8 @@ impl Target {
 
     /// 返回完整的规范化 URL（scheme://authority/path?query）
     ///
-    /// 用于日志和调试，不含 userinfo 和 fragment。
+    /// 用于环检测和 Location 拼接的 base，**不用于日志**（含 query）。
+    /// 不含 userinfo 和 fragment。
     pub fn full_url(&self) -> String {
         format!(
             "{}://{}{}",
@@ -243,6 +250,14 @@ impl Target {
             self.authority(),
             self.request_target()
         )
+    }
+
+    /// 用于日志的安全目标展示：`scheme://authority + path`，**不含 query**
+    ///
+    /// query 可能携带 API key、token、签名 URL 参数等敏感信息，
+    /// 禁止进入日志（DESIGN §9）。调试定位有 host + path 已足够。
+    pub fn display_safe(&self) -> String {
+        format!("{}://{}{}", self.scheme, self.authority(), self.path)
     }
 }
 
@@ -368,5 +383,34 @@ mod tests {
     fn test_full_url() {
         let target = parse_target("/https://example.com:8443/data?q=1").unwrap();
         assert_eq!(target.full_url(), "https://example.com:8443/data?q=1");
+    }
+
+    /// N4 回归：IPv6 字面量 authority 必须用方括号包裹
+    #[test]
+    fn test_ipv6_authority_bracketed() {
+        let target = parse_target("/http://[2606:4700::1]:8080/x").unwrap();
+        assert_eq!(target.authority(), "[2606:4700::1]:8080");
+        assert_eq!(target.full_url(), "http://[2606:4700::1]:8080/x");
+    }
+
+    /// N4 回归：IPv6 默认端口省略但仍带方括号
+    #[test]
+    fn test_ipv6_authority_default_port() {
+        let target = parse_target("/https://[::1]/").unwrap();
+        assert_eq!(target.authority(), "[::1]");
+        assert_eq!(target.full_url(), "https://[::1]/");
+    }
+
+    /// IPv4 与域名 authority 不受影响
+    #[test]
+    fn test_ipv4_and_domain_authority_unbracketed() {
+        assert_eq!(
+            parse_target("/http://1.2.3.4:8080/").unwrap().authority(),
+            "1.2.3.4:8080"
+        );
+        assert_eq!(
+            parse_target("/https://example.com/").unwrap().authority(),
+            "example.com"
+        );
     }
 }

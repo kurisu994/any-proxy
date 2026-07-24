@@ -62,37 +62,51 @@ where
             this.reset_sleep();
         }
 
-        // 1. 先检查定时器是否到期
-        if let Some(sleep) = &mut this.sleep {
-            if sleep.as_mut().poll(cx).is_ready() {
-                tracing::warn!(
-                    timeout_ms = this.timeout.as_millis() as u64,
-                    "body idle timeout，中止流"
-                );
-                crate::telemetry::log_stream_aborted("unknown", "body_idle_timeout", 0);
-                return Poll::Ready(Some(Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "body idle timeout",
-                ))));
+        // 循环是为了丢弃 trailer frame 后继续读下一个 frame，
+        // 而不是把 trailer 透传给下游。
+        loop {
+            // 1. 先检查定时器是否到期
+            if let Some(sleep) = &mut this.sleep {
+                if sleep.as_mut().poll(cx).is_ready() {
+                    tracing::warn!(
+                        timeout_ms = this.timeout.as_millis() as u64,
+                        "body idle timeout，中止流"
+                    );
+                    crate::telemetry::log_stream_aborted("unknown", "body_idle_timeout", 0);
+                    return Poll::Ready(Some(Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "body idle timeout",
+                    ))));
+                }
             }
-        }
 
-        // 2. 轮询内部 body
-        match Pin::new(&mut this.inner).poll_frame(cx) {
-            Poll::Ready(Some(Ok(frame))) => {
-                // 成功读取 frame，重置定时器
-                this.reset_sleep();
-                Poll::Ready(Some(Ok(frame)))
-            }
-            Poll::Ready(Some(Err(e))) => {
-                tracing::warn!(error = ?e, "body frame 错误");
-                Poll::Ready(Some(Err(std::io::Error::other("body frame error"))))
-            }
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => {
-                // inner 还没数据，定时器已在上面注册了 waker
-                // 当定时器到期或 inner 有数据时都会被唤醒
-                Poll::Pending
+            // 2. 轮询内部 body
+            match Pin::new(&mut this.inner).poll_frame(cx) {
+                Poll::Ready(Some(Ok(frame))) => {
+                    // 有活动，重置定时器
+                    this.reset_sleep();
+
+                    if frame.is_data() {
+                        return Poll::Ready(Some(Ok(frame)));
+                    }
+
+                    // trailer frame：直接丢弃，不透传。
+                    // DESIGN §7 承诺不转发 trailers；更重要的是 trailer frame
+                    // 不经过 headers::clean_request/response_headers，若透传会让
+                    // Set-Cookie、Cookie、转发头、CORS 等借 trailer 绕过全部清理策略。
+                    tracing::debug!("丢弃上游 trailer frame");
+                    continue;
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    tracing::warn!(error = ?e, "body frame 错误");
+                    return Poll::Ready(Some(Err(std::io::Error::other("body frame error"))));
+                }
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => {
+                    // inner 还没数据，定时器已在上面注册了 waker
+                    // 当定时器到期或 inner 有数据时都会被唤醒
+                    return Poll::Pending;
+                }
             }
         }
     }
@@ -114,4 +128,73 @@ pub fn wrap_request_body(body: axum::body::Body, timeout: Duration) -> axum::bod
     use http_body_util::BodyExt;
     let wrapped = IdleTimeoutBody::new(body, timeout);
     axum::body::Body::new(wrapped.map_err(axum::Error::new))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Bytes;
+    use http::HeaderMap;
+    use http_body_util::BodyExt;
+    use std::convert::Infallible;
+
+    /// 先发一个 data frame，再发一个带 Set-Cookie 的 trailer frame
+    struct BodyWithTrailer {
+        data_sent: bool,
+        trailer_sent: bool,
+    }
+
+    impl HttpBody for BodyWithTrailer {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<http_body::Frame<Bytes>, Infallible>>> {
+            let this = self.get_mut();
+            if !this.data_sent {
+                this.data_sent = true;
+                return Poll::Ready(Some(Ok(http_body::Frame::data(Bytes::from_static(b"hello")))));
+            }
+            if !this.trailer_sent {
+                this.trailer_sent = true;
+                let mut tm = HeaderMap::new();
+                tm.insert("set-cookie", "evil=1".parse().unwrap());
+                return Poll::Ready(Some(Ok(http_body::Frame::trailers(tm))));
+            }
+            Poll::Ready(None)
+        }
+    }
+
+    /// M2 回归：trailer frame 必须被丢弃，不能透传给下游
+    ///
+    /// 否则 Set-Cookie / Cookie / CORS 等可借 trailer 绕过 header 清理。
+    #[tokio::test]
+    async fn test_trailer_frame_dropped() {
+        let body = IdleTimeoutBody::new(
+            BodyWithTrailer {
+                data_sent: false,
+                trailer_sent: false,
+            },
+            Duration::from_secs(30),
+        );
+        let collected = body.collect().await.unwrap();
+        assert!(
+            collected.trailers().is_none(),
+            "trailer 必须被丢弃，不能透传"
+        );
+        assert_eq!(collected.to_bytes(), Bytes::from_static(b"hello"));
+    }
+
+    /// data frame 正常透传，不受 trailer 丢弃逻辑影响
+    #[tokio::test]
+    async fn test_data_frames_pass_through() {
+        let body = IdleTimeoutBody::new(
+            axum::body::Body::from("hello world"),
+            Duration::from_secs(30),
+        );
+        let collected = body.collect().await.unwrap();
+        assert_eq!(collected.to_bytes(), Bytes::from_static(b"hello world"));
+    }
 }

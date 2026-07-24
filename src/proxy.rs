@@ -208,7 +208,7 @@ where
 
         tracing::debug!(
             request_id = %request_id,
-            target = %current_target.full_url(),
+            target = %current_target.display_safe(),
             "连接上游"
         );
 
@@ -289,7 +289,7 @@ where
                     tracing::debug!(
                         request_id = %request_id,
                         status = status,
-                        new_target = %new_target.full_url(),
+                        new_target = %new_target.display_safe(),
                         "跟随重定向"
                     );
                     current_target = new_target;
