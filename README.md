@@ -27,6 +27,15 @@ https://proxy.your-server.com/https://api.example.com/data?city=shanghai
 
 请求从部署服务器的网络出口发出，浏览器可读取返回的 CORS 响应。
 
+### 出口位置决定它能做什么
+
+代理请求从**部署服务器所在网络**发出，因此它解决的是**跨域（CORS）**问题，而不是**网络可达性**问题：
+
+- ✅ **有收益**：浏览器因同源策略无法直接读取的公共 API，经代理转发后带上 CORS 头即可读取。
+- ❌ **无收益**：若部署在大陆 VPS，出口仍是国内网络，对境外 API 的可达性不会改善——被墙的目标依旧不可达。要访问境外 API，代理必须部署在能直连目标的网络位置。
+
+一句话：**它是 CORS 中继，不是翻墙工具。**
+
 ## 快速开始
 
 ### 从源码构建
@@ -60,12 +69,31 @@ curl http://localhost:8080/healthz
 # ok
 ```
 
+### 冒烟测试
+
+代理一个真实公共 API（`-i` 可看到代理补上的 CORS 响应头）：
+
+```bash
+curl -i http://localhost:8080/https://api.github.com/zen
+# 返回一句随机格言，响应头带 access-control-allow-origin: *
+```
+
+浏览器中跨域读取（把目标 URL 拼在代理前缀后即可）：
+
+```js
+const proxy = "http://localhost:8080/";
+const target = "https://api.github.com/zen";
+fetch(proxy + target)
+  .then((r) => r.text())
+  .then(console.log);
+```
+
 ## 安全边界
 
 any-proxy 的安全边界完全在**目标地址校验**：
 
 - 拒绝本机、私网、链路本地、保留地址和云元数据地址
-- IPv6 采用正向白名单（真 fail-closed）：仅允许 `2000::/3` 全局单播，其余一律拒绝
+- IPv6 采用正向白名单（真 fail-closed）：仅允许 `2000::/3` 全局单播，并显式拒绝其中的 6to4 / Teredo / ORCHID 等嵌入 IPv4 的转换地址
 - IPv4 采用穷举 denylist：不在 deny 列表中的地址视为公网（因 `Ipv4Addr::is_global()` 尚未稳定，这是取舍）
 - DNS 解析与实际 TCP 连接在同一个 Connector 内原子绑定，防止 DNS rebinding
 - HTTPS 目标在 TCP 连接建立后进行 TLS 握手，SNI 和证书校验使用原始规范化主机名
@@ -79,7 +107,6 @@ any-proxy 的安全边界完全在**目标地址校验**：
 - 宿主接口地址每 60 秒刷新，网络配置变化后最多 60 秒竞态窗口
 - 允许任意公共端口 1-65535，实例可被用于端口扫描
 - 公网匿名无额度控制的风险没有技术消除
-- `2000::/3` 内含 6to4、Teredo 等嵌入 IPv4 的转换地址，宿主有对应路由时构成条件式 SSRF（[TODOS](TODOS.md) E8）
 - 新分配的 IANA IPv4 特殊用途段在补进 deny 列表前会被放行
 
 > 完整的已知偏差清单见 [DESIGN.md 第 10 节](DESIGN.md#10-已知偏差汇总)。
@@ -114,6 +141,24 @@ any-proxy 的安全边界完全在**目标地址校验**：
 | `/` | GET | 用法说明与风险提示 |
 | (任意) | CONNECT/TRACE | 405 拒绝 |
 
+### 错误码
+
+响应头发出前的代理错误返回稳定 JSON：`{"error":{"code":"...","message":"...","request_id":"..."}}`。上游返回的合法 4xx/5xx 按原样转发，不转成代理错误。
+
+| code | HTTP | 常见原因 | 排查动作 |
+|------|------|----------|----------|
+| `invalid_target` | 400 | URL 非法、带 userinfo、端口越界、URI 超长 | 检查代理前缀后的目标 URL 格式 |
+| `target_blocked` | 403 | 目标解析到私网/保留/宿主地址，或 HTTPS 降级 | 确认目标是公网地址；是否命中 `DENY_CIDRS` |
+| `method_not_allowed` | 405 | 使用了 CONNECT/TRACE 等不支持的方法 | 仅用 GET/HEAD/POST/PUT/PATCH/DELETE/OPTIONS |
+| `dns_failed` | 502 | 域名无法解析或返回空答案 | 确认域名可解析；检查代理所在网络 DNS |
+| `connect_failed` | 502 | 所有候选地址 TCP/TLS 均失败 | 目标端口是否开放；TLS 证书是否可信 |
+| `upstream_failed` | 502 | 上游 HTTP 协议错误 | 确认目标返回合法 HTTP |
+| `service_overloaded` | 503 | 活跃传输数达 `MAX_CONCURRENT_REQUESTS` | 稍后重试；或上调并发上限 / 扩容 |
+| `connect_timeout` | 504 | DNS / TCP / TLS 阶段超时 | 目标是否慢；按需上调 `DNS_TIMEOUT` / `CONNECT_TIMEOUT` / `TLS_TIMEOUT` |
+| `upstream_timeout` | 504 | 等待上游响应头超时 | 上调 `UPSTREAM_HEADERS_TIMEOUT` |
+
+> 响应头一旦发出，后续 body 错误无法改写状态码：连接中止，调用方看到截断 body。
+
 ### 并发与超时语义
 
 - **没有总请求时长上限。** 只要数据在流动，多长的传输都不会被代理主动中断。
@@ -138,12 +183,10 @@ any-proxy 的安全边界完全在**目标地址校验**：
 ### Header 清理
 
 - 请求/响应都处理 `Connection` header 的逗号分隔 token，删除其中点名的 headers
-- 删除固定 hop-by-hop 集合：`Connection`、`Keep-Alive`、`Proxy-*`、`TE`、`Trailer`、`Transfer-Encoding`、`Upgrade`
-- 请求侧额外移除 `Host`、`Forwarded`、`Via`、`X-Forwarded-*`、`Cookie`
-- 响应侧额外移除 `Set-Cookie`、上游 CORS headers、`Server`、`X-Powered-By`
-
-> ⚠️ 当前实现有两处偏差：`Proxy-Connection` 等前缀未被通配清理；**trailer frame 会绕过上述全部清理**
-> 并原样透传（[TODOS](TODOS.md) M2）。修复前不要依赖 trailer 侧的清理保证。
+- 删除固定 hop-by-hop 集合：`Connection`、`Keep-Alive`、`Proxy-Authenticate`、`Proxy-Authorization`、`TE`、`Trailer`、`Transfer-Encoding`、`Upgrade`
+- 请求侧额外移除 `Host`、`Forwarded`、`Via`、`Cookie`，并通配清理 `Proxy-*` 与 `X-Forwarded-*` 前缀
+- 响应侧额外移除 `Set-Cookie`、上游 CORS headers、`Server`、`X-Powered-By`；保留上游 `Vary` 并追加 CORS 缓存维度
+- **trailer frame 一律丢弃、不透传**，避免 `Set-Cookie` / `Cookie` / CORS 借 trailer 绕过上述清理
 
 ## 开发
 
@@ -172,7 +215,7 @@ LISTEN_ADDR=127.0.0.1:9090 cargo run --release
 ### 测试
 
 ```bash
-cargo test                          # 全部测试（126 个）
+cargo test                          # 全部测试
 cargo test --test relay             # M1 端到端集成测试
 cargo test --test integration       # Connector 集成测试
 cargo test --test tls_spike         # TLS spike 测试

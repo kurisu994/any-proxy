@@ -67,15 +67,14 @@
 - [x] **N14（P3）/healthz 无 CORS headers** — 其他所有响应都带，唯独健康检查没有。
   - 修复：`build_healthz_response` 补 `add_cors_headers`。文件：`src/error.rs`
 
-## 第 4 档 — 产品真实性（立即做，成本极低）
+## 第 4 档 — 产品真实性（✅ 已完成）
 
-- [ ] **D2（P1）README 海外出口前提** — 首屏写明「部署在大陆 VPS 出口仍是国内，对境外 API 可达性无收益」。
-  - Codex 评价当前 README 是「法律式准确、产品式不诚实」：只说「从部署服务器网络出口发出」，没说清这对目标用户意味着什么。CORS 价值成立，可达性价值不成立。
-  - 文件：`README.md` · CC ~5min
-- [ ] **D5（P2）错误码表** — README 增加 错误码→HTTP→常见原因→排查动作 对照表（含本次新增的 `503 service_overloaded`）；可选给错误响应加安全不泄密的 `reason` 字段区分 `dns_failed`/`connect_failed`。
-  - 文件：`README.md`、`src/error.rs` · CC ~15min
-- [ ] **D4（P2）冒烟示例** — README 增加可粘贴 `curl` 代理真实公共 API + 浏览器 `fetch()` 片段，超越 `/healthz`。
-  - 文件：`README.md` · CC ~10min
+- [x] **D2（P1）README 海外出口前提** — 首屏写明「部署在大陆 VPS 出口仍是国内，对境外 API 可达性无收益」。
+  - 修复：工作原理下新增「出口位置决定它能做什么」小节，明确 CORS 有收益、可达性无收益，「是 CORS 中继不是翻墙工具」。文件：`README.md`
+- [x] **D5（P2）错误码表** — README 增加 错误码→HTTP→常见原因→排查动作 对照表（含本次新增的 `503 service_overloaded`）；可选给错误响应加安全不泄密的 `reason` 字段区分 `dns_failed`/`connect_failed`。
+  - 修复：HTTP 接口下新增错误码对照表（9 个 code）。`reason` 字段属可选增强，暂未做。文件：`README.md`
+- [x] **D4（P2）冒烟示例** — README 增加可粘贴 `curl` 代理真实公共 API + 浏览器 `fetch()` 片段，超越 `/healthz`。
+  - 修复：快速开始下新增「冒烟测试」小节（curl + fetch 代理 `api.github.com/zen`）。文件：`README.md`
 
 ## 第 5 档 — 安全默认（在 D3 之前）
 
