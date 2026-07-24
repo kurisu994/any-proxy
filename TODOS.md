@@ -100,13 +100,12 @@
 
 ## 第 7 档 — 测试与供应链
 
-- [ ] **N10（P2）测试基础设施与覆盖缺口** — 详见 `~/.gstack/projects/kurisu994-any-proxy/kurisu-main-autoplan-test-plan-20260724.md`
-  - **先决条件**：`tests/fixture.rs` 的假上游从不解析请求（读一次就回定长响应），因此没有任何测试能断言「代理实际发给上游的是什么」——N1/N2/N3 全在这个盲区。需要一个录制式假上游。CC ~40min
-  - `src/proxy.rs`（343 行核心编排）0 单测；`src/body_timeout.rs`（117 行）0 单测
-  - **POST/PUT/PATCH/DELETE 无任何端到端测试**（M1 标准 2 要求 6 个 method，只测了 GET/HEAD）
-  - **全仓库没有端到端重定向测试**；`test_redirect_chain_multiple_connects` 名不副实，只是顺序连了两个 server，从未产生 3xx —— E1 能进主干的根因
-  - `test_streaming_256mib` 只数字节数从不测内存，M1 标准 3 处于「宣称完成、从未验证」
-  - 无 trailer 测试（M1 标准 5 要求）
+- [ ] **N10（P2）测试基础设施与覆盖缺口** — 详见 `~/.gstack/projects/kurisu994-any-proxy/kurisu-main-autoplan-test-plan-20260724.md`。本批已补齐核心盲区，剩余留后续：
+  - ✅ **录制式假上游先决条件**：`tests/fixture.rs::RecordingServer` 完整解析并记录请求（method/path/headers/body，含 chunked 解码），可编程响应（支持 3xx）
+  - ✅ **POST/PUT/PATCH/DELETE 端到端**：`test_methods_with_body_forwarded` 断言 method/path/body 转发正确与 Host 重建
+  - ✅ **端到端重定向**：`test_redirect_followed_end_to_end` 是首个真正产生 3xx 的端到端测试，兼验 N2 相对 Location 解析
+  - ✅ trailer 丢弃测试（`body_timeout::test_trailer_frame_dropped`）、body 字节计数测试（本批 N13）
+  - ⏳ 剩余：`src/proxy.rs` 仍缺针对性单测；`test_streaming_256mib` 仍只数字节不测内存；`test_redirect_chain_multiple_connects` 名不副实，待重构/重命名
 - [x] **（P3）CI 盲区：clippy 未覆盖测试代码** — CI 跑 `cargo clippy -- -D warnings`，不带 `--all-targets`，因此 `tests/` 里的 lint 长期未被拦截。应改为 `cargo clippy --all-targets -- -D warnings`。
   - 文件：`.github/workflows/ci.yml` · CC ~2min
 - [x] **（P3）CI 无 MSRV 作业** — `rust-version = "1.75"` 从未被验证，CI 只跑 stable。

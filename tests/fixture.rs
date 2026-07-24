@@ -7,12 +7,13 @@
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use rcgen::CertificateParams;
 use rcgen::KeyPair;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::rustls;
 use tokio_rustls::TlsAcceptor;
 
@@ -202,6 +203,248 @@ impl TestServer {
     pub fn shutdown(self) {
         self.join_handle.abort();
     }
+}
+
+/// 一条被录制的上游请求
+///
+/// 与 `TestServer` 不同，`RecordingServer` 完整解析请求行、headers 和 body，
+/// 供测试断言「代理实际发给上游的是什么」——这是 N1/N2/N3 长期缺失的能力（N10）。
+#[derive(Debug, Clone)]
+pub struct RecordedRequest {
+    pub method: String,
+    pub path: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl RecordedRequest {
+    /// 按名取 header 值（大小写不敏感）
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// 预设响应：按请求顺序返回
+#[derive(Clone)]
+pub struct CannedResponse {
+    pub status: u16,
+    /// 3xx 的 `Location`（相对或绝对）
+    pub location: Option<String>,
+    pub body: String,
+}
+
+impl CannedResponse {
+    /// 200 + 指定 body
+    pub fn ok(body: &str) -> Self {
+        Self {
+            status: 200,
+            location: None,
+            body: body.to_string(),
+        }
+    }
+
+    /// 3xx 重定向到 `location`
+    pub fn redirect(status: u16, location: &str) -> Self {
+        Self {
+            status,
+            location: Some(location.to_string()),
+            body: String::new(),
+        }
+    }
+}
+
+/// 录制式假上游服务器
+///
+/// 解析并记录每个请求（method / path / headers / body），按请求全局序号返回
+/// 预设响应（序号超出时重复最后一条）。代理不复用连接，故重定向的每一跳都是新连接，
+/// 用跨连接的原子计数器区分请求序号。
+pub struct RecordingServer {
+    pub addr: SocketAddr,
+    requests: Arc<Mutex<Vec<RecordedRequest>>>,
+    join_handle: tokio::task::JoinHandle<()>,
+}
+
+impl RecordingServer {
+    /// 启动录制服务器，`responses` 按请求顺序返回
+    pub async fn start(responses: Vec<CannedResponse>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let counter = Arc::new(AtomicUsize::new(0));
+        let responses = Arc::new(responses);
+
+        let req_store = requests.clone();
+        let join_handle = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                let req_store = req_store.clone();
+                let counter = counter.clone();
+                let responses = responses.clone();
+                tokio::spawn(async move {
+                    let recorded = match read_http_request(&mut socket).await {
+                        Some(r) => r,
+                        None => return,
+                    };
+                    req_store.lock().unwrap().push(recorded);
+
+                    let idx = counter.fetch_add(1, Ordering::SeqCst);
+                    let resp = responses
+                        .get(idx)
+                        .or_else(|| responses.last())
+                        .cloned()
+                        .unwrap_or_else(|| CannedResponse::ok("ok"));
+
+                    let mut head = format!(
+                        "HTTP/1.1 {} X\r\nContent-Length: {}\r\n",
+                        resp.status,
+                        resp.body.len()
+                    );
+                    if let Some(loc) = &resp.location {
+                        head.push_str(&format!("Location: {loc}\r\n"));
+                    }
+                    head.push_str("Connection: close\r\n\r\n");
+                    let full = format!("{head}{}", resp.body);
+                    let _ = socket.write_all(full.as_bytes()).await;
+                });
+            }
+        });
+
+        Self {
+            addr,
+            requests,
+            join_handle,
+        }
+    }
+
+    /// 返回已录制的所有请求（按到达顺序）
+    pub fn recorded(&self) -> Vec<RecordedRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+
+    /// 关闭服务器
+    pub fn shutdown(self) {
+        self.join_handle.abort();
+    }
+}
+
+/// 在字节流中查找子序列位置
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// 读取并解析一条完整 HTTP 请求（支持 Content-Length 与 chunked body）
+async fn read_http_request(socket: &mut TcpStream) -> Option<RecordedRequest> {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 1024];
+
+    // 1. 读到 headers 结束（\r\n\r\n）
+    let header_end = loop {
+        if let Some(pos) = find_subsequence(&buf, b"\r\n\r\n") {
+            break pos + 4;
+        }
+        let n = socket.read(&mut tmp).await.ok()?;
+        if n == 0 {
+            return None;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if buf.len() > 64 * 1024 {
+            return None;
+        }
+    };
+
+    // 2. 解析请求行与 headers
+    let head_str = String::from_utf8_lossy(&buf[..header_end]).to_string();
+    let mut lines = head_str.split("\r\n");
+    let request_line = lines.next()?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next()?.to_string();
+    let path = parts.next()?.to_string();
+
+    let mut headers = Vec::new();
+    let mut content_length = 0usize;
+    let mut is_chunked = false;
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            let k = k.trim().to_string();
+            let v = v.trim().to_string();
+            if k.eq_ignore_ascii_case("content-length") {
+                content_length = v.parse().unwrap_or(0);
+            }
+            if k.eq_ignore_ascii_case("transfer-encoding") && v.to_lowercase().contains("chunked") {
+                is_chunked = true;
+            }
+            headers.push((k, v));
+        }
+    }
+
+    // 3. 读取 body
+    let leftover = buf[header_end..].to_vec();
+    let body = if is_chunked {
+        read_chunked_body(socket, leftover).await
+    } else {
+        let mut body = leftover;
+        while body.len() < content_length {
+            let n = socket.read(&mut tmp).await.ok()?;
+            if n == 0 {
+                break;
+            }
+            body.extend_from_slice(&tmp[..n]);
+        }
+        body.truncate(content_length);
+        body
+    };
+
+    Some(RecordedRequest {
+        method,
+        path,
+        headers,
+        body,
+    })
+}
+
+/// 读取 chunked 编码的 body，返回解码后的字节
+async fn read_chunked_body(socket: &mut TcpStream, initial: Vec<u8>) -> Vec<u8> {
+    let mut pending = initial;
+    let mut body = Vec::new();
+    let mut tmp = [0u8; 1024];
+    loop {
+        // 读到一整行 chunk-size
+        let line_end = loop {
+            if let Some(p) = find_subsequence(&pending, b"\r\n") {
+                break p;
+            }
+            match socket.read(&mut tmp).await {
+                Ok(n) if n > 0 => pending.extend_from_slice(&tmp[..n]),
+                _ => return body,
+            }
+        };
+        let size_str = String::from_utf8_lossy(&pending[..line_end]).to_string();
+        let size = usize::from_str_radix(size_str.trim(), 16).unwrap_or(0);
+        pending.drain(..line_end + 2);
+        if size == 0 {
+            break;
+        }
+        // 确保 pending 有 size + 2（数据 + CRLF）
+        while pending.len() < size + 2 {
+            match socket.read(&mut tmp).await {
+                Ok(n) if n > 0 => pending.extend_from_slice(&tmp[..n]),
+                _ => break,
+            }
+        }
+        let take = size.min(pending.len());
+        body.extend_from_slice(&pending[..take]);
+        pending.drain(..(size + 2).min(pending.len()));
+    }
+    body
 }
 
 /// 生成自签名测试证书，返回 DER 编码的证书和私钥
