@@ -62,11 +62,11 @@ docker build -t any-proxy .
 docker run -d -p 8080:8080 any-proxy
 ```
 
-健康检查：
+健康检查（回显构建版本号）：
 
 ```bash
 curl http://localhost:8080/healthz
-# ok
+# {"status":"ok","version":"0.1.0"}
 ```
 
 ### 冒烟测试
@@ -192,8 +192,8 @@ any-proxy 的安全边界完全在**目标地址校验**：
 
 ### 环境要求
 
-- Rust 1.75+（MSRV）
-- Cargo 1.75+
+- Rust 1.86+（MSRV，受 `url` / `icu` 传递依赖约束，CI 有专门作业锁定）
+- Cargo 1.86+
 
 ### 构建
 

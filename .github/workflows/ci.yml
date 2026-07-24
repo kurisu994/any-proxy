@@ -35,7 +35,31 @@ jobs:
 
       - name: cargo clippy
         # --all-targets 让 clippy 覆盖 tests/，否则测试代码的 lint 不会被拦截
-        run: cargo clippy --all-targets -- -D warnings
+        # --locked 确保 Cargo.lock 不在 CI 静默漂移
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: cargo test
-        run: cargo test
+        run: cargo test --locked
+
+  msrv:
+    name: MSRV (1.86)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 MSRV 工具链
+        # 与 Cargo.toml 的 rust-version 保持一致，防止无意引入更高版本特性
+        uses: dtolnay/rust-toolchain@1.86
+
+      - name: cargo check --locked
+        run: cargo check --locked
+
+  audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 依赖安全审计
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

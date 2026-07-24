@@ -3,18 +3,19 @@ FROM rust:1.83-bookworm AS builder
 
 WORKDIR /build
 
-# 先复制 Cargo 文件以利用 Docker 缓存
+# 先复制 Cargo 清单以利用 Docker 层缓存：用占位 lib.rs + main.rs 预编译依赖。
+# crate 同时有 lib 与 bin target，占位必须两者都造；否则依赖层无法命中、每次全量重编。
+# 不吞错误（去掉旧的 `2>/dev/null || true`），预编译失败应立即暴露。
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo 'fn main() {}' > src/main.rs && \
-    mkdir -p tests && \
-    cargo build --release 2>/dev/null || true
+RUN mkdir src && \
+    echo 'fn main() {}' > src/main.rs && \
+    echo '' > src/lib.rs && \
+    cargo build --release --locked && \
+    rm -rf src
 
-# 复制实际源码
+# 复制实际源码并构建 release 二进制（依赖层已缓存）
 COPY src/ src/
-COPY tests/ tests/
-
-# 构建 release 二进制
-RUN cargo build --release
+RUN cargo build --release --locked
 
 # 运行阶段：最小化镜像
 FROM debian:bookworm-slim

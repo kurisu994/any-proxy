@@ -161,12 +161,17 @@ pub fn build_index_response() -> Response<Body> {
 
 /// 构建 /healthz 健康检查响应
 ///
-/// 与其他所有响应一致带 CORS headers，便于浏览器侧探活（N14）。
+/// 返回 JSON `{"status":"ok","version":"<CARGO_PKG_VERSION>"}`，回显构建版本便于
+/// 部署后核对与 canary（D6）。与其他响应一致带 CORS headers，便于浏览器探活（N14）。
 pub fn build_healthz_response() -> Response<Body> {
+    let body = format!(
+        r#"{{"status":"ok","version":"{}"}}"#,
+        env!("CARGO_PKG_VERSION")
+    );
     let mut response = Response::builder()
         .status(StatusCode::OK)
-        .header(http::header::CONTENT_TYPE, "text/plain")
-        .body(Body::from("ok"))
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
         .expect("健康检查响应构建不会失败");
 
     headers::add_cors_headers(response.headers_mut());
@@ -234,6 +239,11 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         // N14：健康检查也带 CORS，便于浏览器探活
         assert!(resp.headers().get("access-control-allow-origin").is_some());
+        // D6：回显版本号，content-type 为 JSON
+        assert_eq!(
+            resp.headers().get(http::header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
     }
 
     #[test]

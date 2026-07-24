@@ -92,11 +92,11 @@
 - [ ] **D3（P1→降序）Caddy TLS 示例** — `docker-compose.caddy.yml` + `Caddyfile`，一键起公网 HTTPS。
   - ⚠️ **顺序已调整**：原本排在 A 档最前。Codex 指出它会让服务更容易公网暴露，必须排在安全默认（C1）之后，否则等于加速推广一个不可运营的默认配置。
   - 文件：`docker-compose.caddy.yml`（新建）、`Caddyfile`（新建）、`README.md` · CC ~20min
-- [ ] **D6（P2→提前）版本端点与预构建镜像** — `/healthz` 回显版本号；发布预构建镜像 + SemVer tag + 固定版本 compose。
+- [ ] **D6（P2→提前）版本端点与预构建镜像** — ✅ 版本端点已做：`/healthz` 回显 `{"status":"ok","version":"…"}`（`src/error.rs`）。⏳ 预构建镜像 + SemVer tag + 固定版本 compose 待做（与「多架构镜像」合并处理）。
   - ⚠️ Codex 建议提前：「目标用户不该先本地编译 Rust」，这是当前最大的分发摩擦之一。
-  - 文件：`src/error.rs`、`docker-compose.yml`、`.github/workflows/` · CC ~30min
-- [ ] **N11（P3）容器加固** — compose 补 `read_only`、`cap_drop`、`no-new-privileges`、内存/pids 上限。对无额度开放代理，资源上限是唯一兜底。另：Dockerfile 依赖缓存层是坏的（只造 dummy `src/main.rs`，但 crate 还有 lib target，预构建必失败且被 `|| true` 吞掉，每次都全量重编）。
-  - 文件：`Dockerfile`、`docker-compose.yml` · CC ~20min
+  - 文件：`src/error.rs`（已改）、`docker-compose.yml`、`.github/workflows/`
+- [x] **N11（P3）容器加固** — compose 补 `read_only`、`cap_drop`、`no-new-privileges`、内存/pids 上限。对无额度开放代理，资源上限是唯一兜底。另：Dockerfile 依赖缓存层是坏的（只造 dummy `src/main.rs`，但 crate 还有 lib target，预构建必失败且被 `|| true` 吞掉，每次都全量重编）。
+  - 修复：compose 补齐 4 项加固；Dockerfile 占位同时造 lib.rs+main.rs、去掉吞错误的 `|| true`、加 `--locked`。文件：`Dockerfile`、`docker-compose.yml`
 
 ## 第 7 档 — 测试与供应链
 
@@ -109,12 +109,12 @@
   - 无 trailer 测试（M1 标准 5 要求）
 - [x] **（P3）CI 盲区：clippy 未覆盖测试代码** — CI 跑 `cargo clippy -- -D warnings`，不带 `--all-targets`，因此 `tests/` 里的 lint 长期未被拦截。应改为 `cargo clippy --all-targets -- -D warnings`。
   - 文件：`.github/workflows/ci.yml` · CC ~2min
-- [ ] **（P3）CI 无 MSRV 作业** — `rust-version = "1.75"` 从未被验证，CI 只跑 stable。
-  - 文件：`.github/workflows/ci.yml` · CC ~5min
-- [ ] **N9（P2）供应链** — `hyper-rustls`、`rustls-pemfile`、`futures-util` 零引用（`tower` 已随本批移除）；`hyper-util` 只需 `tokio` feature。Dockerfile 与 CI 均未用 `--locked`，锁文件可静默漂移。
-  - 文件：`Cargo.toml`、`Dockerfile`、`.github/workflows/ci.yml` · CC ~20min
-- [ ] **E11（P3）CI 依赖安全检查** — `cargo deny` / `cargo audit`。
-  - 文件：`.github/workflows/ci.yml` · CC ~5min
+- [x] **（P3）CI 无 MSRV 作业** — `rust-version = "1.75"` 从未被验证，CI 只跑 stable。
+  - 修复：实测 1.75/1.85 均因 `icu`/`idna` 传递依赖不可行，真实 MSRV = **1.86**；更新 `rust-version` 与 README，CI 新增 `msrv` 作业（`dtolnay/rust-toolchain@1.86` + `cargo check --locked`）锁定。文件：`Cargo.toml`、`README.md`、`.github/workflows/ci.yml`
+- [x] **N9（P2）供应链** — `hyper-rustls`、`rustls-pemfile`、`futures-util` 零引用（`tower` 已随本批移除）；`hyper-util` 只需 `tokio` feature。Dockerfile 与 CI 均未用 `--locked`，锁文件可静默漂移。
+  - 修复：删除三个零引用依赖，`hyper-util` 收窄为 `["tokio"]`；Dockerfile 两处 build 与 CI clippy/test/check 全部加 `--locked`。文件：`Cargo.toml`、`Cargo.lock`、`Dockerfile`、`.github/workflows/ci.yml`
+- [x] **E11（P3）CI 依赖安全检查** — `cargo deny` / `cargo audit`。
+  - 修复：CI 新增 `audit` 作业（`rustsec/audit-check@v2`）。文件：`.github/workflows/ci.yml`
 - [ ] **（P2）多架构镜像** — Linux amd64 + arm64 由 CI 构建，附 SHA-256 校验文件。
   - 文件：`.github/workflows/` · CC ~30min
 - [ ] **（P3）SBOM / provenance / 容器启动测试** — 后置。
