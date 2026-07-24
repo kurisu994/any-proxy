@@ -104,7 +104,7 @@
   - **全仓库没有端到端重定向测试**；`test_redirect_chain_multiple_connects` 名不副实，只是顺序连了两个 server，从未产生 3xx —— E1 能进主干的根因
   - `test_streaming_256mib` 只数字节数从不测内存，M1 标准 3 处于「宣称完成、从未验证」
   - 无 trailer 测试（M1 标准 5 要求）
-- [ ] **（P3）CI 盲区：clippy 未覆盖测试代码** — CI 跑 `cargo clippy -- -D warnings`，不带 `--all-targets`，因此 `tests/` 里的 lint 长期未被拦截。应改为 `cargo clippy --all-targets -- -D warnings`。
+- [x] **（P3）CI 盲区：clippy 未覆盖测试代码** — CI 跑 `cargo clippy -- -D warnings`，不带 `--all-targets`，因此 `tests/` 里的 lint 长期未被拦截。应改为 `cargo clippy --all-targets -- -D warnings`。
   - 文件：`.github/workflows/ci.yml` · CC ~2min
 - [ ] **（P3）CI 无 MSRV 作业** — `rust-version = "1.75"` 从未被验证，CI 只跑 stable。
   - 文件：`.github/workflows/ci.yml` · CC ~5min
