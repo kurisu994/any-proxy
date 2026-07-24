@@ -93,8 +93,6 @@ any-proxy 的安全边界完全在**目标地址校验**：
 | `LISTEN_ADDR` | `0.0.0.0:8080` | 监听地址 |
 | `DENY_CIDRS` | (空) | 额外拒绝的 CIDR 列表，逗号分隔 |
 | `MAX_CONCURRENT_REQUESTS` | 256 | 进程级并发上限，达到上限立即返回 `503 service_overloaded` |
-| `MAX_HTTP1_BUFFER_BYTES` | 65536 | HTTP/1 parser buffer 上限 |
-| `MAX_HEADERS_COUNT` | 100 | HTTP/1 header 数量上限 |
 | `MAX_URI_BYTES` | 16384 | URI 最大字节数 |
 | `DNS_TIMEOUT` | 5s | DNS 解析超时 |
 | `CONNECT_TIMEOUT` | 10s | TCP 连接超时 |

@@ -84,7 +84,7 @@ where
             },
             &request_id,
         );
-        log_complete(&request_id, &method, &resp, start, None);
+        log_complete(&request_id, &method, &resp, start, None, None);
         return resp;
     }
 
@@ -107,7 +107,7 @@ where
         "OPTIONS" => ProxyMethod::Options,
         _ => {
             let resp = error::build_method_not_allowed_response(&request_id);
-            log_complete(&request_id, &method, &resp, start, None);
+            log_complete(&request_id, &method, &resp, start, None, None);
             return resp;
         }
     };
@@ -123,7 +123,7 @@ where
                 .and_then(|v| v.to_str().ok()),
             &request_id,
         );
-        log_complete(&request_id, &method, &resp, start, None);
+        log_complete(&request_id, &method, &resp, start, None, None);
         return resp;
     }
 
@@ -132,13 +132,17 @@ where
         Ok(t) => t,
         Err(e) => {
             let resp = error::build_error_response(&e, &request_id);
-            log_complete(&request_id, &method, &resp, start, None);
+            log_complete(&request_id, &method, &resp, start, None, None);
             return resp;
         }
     };
 
     // 对上传 body 应用 idle timeout
-    let body = body_timeout::wrap_request_body(body, state.config.upload_idle_timeout);
+    let body = body_timeout::wrap_request_body(
+        body,
+        state.config.upload_idle_timeout,
+        Arc::from(request_id.as_str()),
+    );
 
     // 执行代理请求（含重定向跟随）
     let result = forward_request(
@@ -159,13 +163,27 @@ where
             } else {
                 None
             };
-            log_complete(&request_id, &method, &resp, start, error_code);
+            log_complete(
+                &request_id,
+                &method,
+                &resp,
+                start,
+                error_code,
+                Some(&target),
+            );
             resp
         }
         Err(e) => {
             let code = e.code();
             let resp = error::build_error_response(&e, &request_id);
-            log_complete(&request_id, &method, &resp, start, Some(code));
+            log_complete(
+                &request_id,
+                &method,
+                &resp,
+                start,
+                Some(code),
+                Some(&target),
+            );
             resp
         }
     }
@@ -297,13 +315,13 @@ where
                 }
                 RedirectAction::PassThrough => {
                     // 原样返回 3xx
-                    return build_proxy_response(response, &state.config);
+                    return build_proxy_response(response, &state.config, Arc::from(request_id));
                 }
             }
         }
 
         // 非重定向，返回响应
-        return build_proxy_response(response, &state.config);
+        return build_proxy_response(response, &state.config, Arc::from(request_id));
     }
 }
 
@@ -311,6 +329,7 @@ where
 fn build_proxy_response(
     response: hyper::Response<hyper::body::Incoming>,
     config: &Config,
+    request_id: Arc<str>,
 ) -> Result<Response, crate::ProxyError> {
     let (mut parts, body) = response.into_parts();
 
@@ -319,28 +338,38 @@ fn build_proxy_response(
     headers::add_cors_headers(&mut parts.headers);
 
     // 应用逐 frame idle timeout 到响应 body
-    let axum_body = body_timeout::wrap_response_body(body, config.upstream_body_idle_timeout);
+    let axum_body =
+        body_timeout::wrap_response_body(body, config.upstream_body_idle_timeout, request_id);
 
     Ok(Response::from_parts(parts, axum_body))
 }
 
 /// 记录请求完成日志（隐私过滤）
 ///
-/// 只记录 request_id、method、status、duration_ms 和可选的 error_code。
-/// 不记录 query、headers、cookie 或 body。
+/// 记录 request_id、method、scheme、host、port、status、duration_ms 和可选 error_code。
+/// scheme/host/port 仅在存在解析后的目标时填充（健康检查/预检/405 无目标，留空）。
+/// 不记录 query、headers、cookie 或 body（DESIGN §9，N13）。
+/// 流式字节计数由 `body_timeout` 在流结束/中止时按同一 request_id 记录。
 fn log_complete(
     request_id: &str,
     method: &http::Method,
     response: &Response,
     start: std::time::Instant,
     error_code: Option<&str>,
+    target: Option<&Target>,
 ) {
     let status = response.status().as_u16();
     let duration = start.elapsed();
+    let scheme = target.map(|t| t.scheme.to_string()).unwrap_or_default();
+    let host = target.map(|t| t.host.as_str()).unwrap_or_default();
+    let port = target.map(|t| t.port).unwrap_or(0);
 
     tracing::info!(
         request_id = %request_id,
         method = %method,
+        scheme = %scheme,
+        host = %host,
+        port = port,
         status = status,
         error_code = ?error_code,
         duration_ms = duration.as_millis() as u64,

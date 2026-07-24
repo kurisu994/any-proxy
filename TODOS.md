@@ -2,7 +2,9 @@
 
 来源：2026-07-15 `/autoplan` 三相评审 + 2026-07-24 `/autoplan` 全量审查（Claude 实测探针 + Codex 交叉验证，10 条结论 8 证实 2 部分成立 0 推翻）。
 
-已完成不列：~~E1 同源重定向误判为环~~、~~D1 容器健康检查失效~~（`904beb9`）、~~M1 并发上限不覆盖响应流~~、~~N1 POOL_IDLE_TIMEOUT 静默截断长传输~~、~~N8 饱和无限挂起~~、~~M2 trailer 旁路~~、~~M3 debug 日志泄露 query~~、~~N2 Location 解析~~、~~N3 304 误跟随~~、~~N4 IPv6 authority~~（本批）。
+已完成不列：~~E1 同源重定向误判为环~~、~~D1 容器健康检查失效~~（`904beb9`）、~~M1 并发上限不覆盖响应流~~、~~N1 POOL_IDLE_TIMEOUT 静默截断长传输~~、~~N8 饱和无限挂起~~、~~M2 trailer 旁路~~、~~M3 debug 日志泄露 query~~、~~N2 Location 解析~~、~~N3 304 误跟随~~、~~N4 IPv6 authority~~（`0f82183`）。
+
+2026-07-24 本批（安全边界 + 代理正确性）：~~N5 错误回显 IP~~、~~E7 host-refresh fail-open~~、~~E8 6to4/Teredo~~、~~N12 DENY_CIDRS fail-closed~~、~~N7 Vary 覆盖~~、~~E9 Proxy-\* 通配清理~~、~~N14 healthz CORS~~、~~N6 SHUTDOWN_GRACE 死配置~~、~~E5 未接线 knob（删除）~~、~~N13 遥测契约~~、~~N15 无 failover~~。E2/E6 决定暂不做（见下）。
 
 排序原则（2026-07-24 定）：**资源边界 → 安全边界 → 产品真实性 → 部署体验**。
 理由：代理转发得对不对是安全运营的前置条件；而降低公网暴露门槛（D3）必须排在安全默认之后，否则是让更多人更容易把不可运营的默认值推上公网。
@@ -19,26 +21,28 @@
   - 修复：移除该 timeout；卡死由逐 frame idle timeout 兜底，连接任务总量由 M1 的 permit 兜底。移除 `POOL_IDLE_TIMEOUT` 配置项（它描述的连接池根本不存在）。
   - 回归测试：`tests/concurrency.rs`，含默认 ignore 的 35 秒真回归（已验证对旧代码在 30.003s 截断、944/1120 字节）。
 
-## 第 2 档 — 安全边界（先做）
+## 第 2 档 — 安全边界（除 E2/E6 均完成，二者暂不做）
 
 - [x] **M2（P1）trailer 绕过 header 清理** — `body_timeout.rs:82` 原样透传所有 frame，trailer frame **从不经过** `clean_request_headers` / `clean_response_headers`。`Set-Cookie`、`Cookie`、转发头、CORS headers 都能藏在 trailer 里穿透代理。这是清理策略旁路，不只是文档不符。
   - 文件：`src/body_timeout.rs`、`src/headers.rs` · CC ~20min
 - [x] **M3（P1）debug 日志泄露完整 query** — `proxy.rs:211`、`proxy.rs:286` 记录 `full_url()`，含 query。`RUST_LOG=debug` 下 API key、签名 URL 全进日志，违反 DESIGN §9。
   - 文件：`src/proxy.rs` · CC ~5min
-- [ ] **N5（P2）错误响应回显已解析的 IP** — `resolver.rs:187` 把 IP 拼进 `TargetBlocked.message`，`error.rs` 原样序列化。违反 DESIGN §8 明文承诺，构成对外的 DNS 解析预言机（可探测代理视角下内网域名的解析结果）。同类：`connector.rs:218` 泄露 peer_addr。
-  - 文件：`src/resolver.rs`、`src/connector.rs` · CC ~10min
-- [ ] **E8（P2）deny 6to4/Teredo** — `2002::/16`、`2001::/32`、`2001:10::/28` 全落在 `2000::/3` 白名单内被放行。宿主配置对应转换路由时，嵌入私网 IPv4 的地址形成条件式 SSRF。双声道一致认定为真实缺口。
-  - 文件：`src/resolver.rs` · CC ~20min
-- [ ] **E7（P2）host-refresh 保留旧快照** — `get_if_addrs()` 失败时用空集合覆盖旧快照（fail-open），之后宿主公网接口地址可能被放行。
-  - 文件：`src/resolver.rs` · CC ~10min
+- [x] **N5（P2）错误响应回显已解析的 IP** — `resolver.rs:187` 把 IP 拼进 `TargetBlocked.message`，`error.rs` 原样序列化。违反 DESIGN §8 明文承诺，构成对外的 DNS 解析预言机（可探测代理视角下内网域名的解析结果）。同类：`connector.rs:218` 泄露 peer_addr。
+  - 修复：对外 message 改为通用文案，被拒 IP/peer_addr 只进内部 `debug`/`warn` 日志。文件：`src/resolver.rs`、`src/connector.rs`
+- [x] **E8（P2）deny 6to4/Teredo** — `2002::/16`、`2001::/32`、`2001:10::/28` 全落在 `2000::/3` 白名单内被放行。宿主配置对应转换路由时，嵌入私网 IPv4 的地址形成条件式 SSRF。双声道一致认定为真实缺口。
+  - 修复：三段加入 `default_deny_cidrs`（含 ORCHID `2001:10::/28`），补断言。文件：`src/resolver.rs`
+- [x] **E7（P2）host-refresh 保留旧快照** — `get_if_addrs()` 失败时用空集合覆盖旧快照（fail-open），之后宿主公网接口地址可能被放行。
+  - 修复：枚举失败时保留旧快照并 warn，只有成功才替换。文件：`src/resolver.rs`
 - [ ] **E2（P2）cfg 门控测试逃生口** — `#[cfg(feature="test-util")]` 门控 `allow_all_for_test` 与无 TLS 的 `Connector::new`。当前 library target 对下游没有结构性保证。
   - 文件：`src/resolver.rs`、`src/connector.rs`、`Cargo.toml` · CC ~10min
+  - 🅿️ **2026-07-24 决定暂不做**：仅影响 library 复用（二进制走可信路径）；`allow_all_for_test` 被 `tests/` 集成测试引用，feature 门控会连带把 `cargo test` 变成必须带 `--features test-util` 并改 CI，与「避免不必要防御性设计」相悖。留待真正 library 化时处理。
 - [ ] **E6（P2）Connector 读真实 peer_addr** — 从真实 `TcpStream` 读而非信任 `DialRecord` 自报，或密封生产 Dialer 类型。当前二进制用可信 `TcpDialer`，风险仅在 library 边界。
   - 文件：`src/connector.rs` · CC ~15min
-- [ ] **N12（P3）DENY_CIDRS 解析失败只 warn** — 运维笔误导致整条防护静默失效。fail-closed 产品的安全配置非法应启动即失败。
-  - 文件：`src/resolver.rs` · CC ~5min
+  - 🅿️ **2026-07-24 决定暂不做**：同 E2，风险仅在 library 边界；`TcpDialer` 已从真实 `TcpStream::peer_addr()` 读取，二进制不受影响。
+- [x] **N12（P3）DENY_CIDRS 解析失败只 warn** — 运维笔误导致整条防护静默失效。fail-closed 产品的安全配置非法应启动即失败。
+  - 修复：`with_env_deny_cidrs` 改返回 `Result`，非法条目返回 `Err`，`main.rs` 启动即 `exit(1)`。文件：`src/resolver.rs`、`src/main.rs`
 
-## 第 3 档 — 代理正确性（P1，与安全边界同批）
+## 第 3 档 — 代理正确性（✅ 已完成）
 
 - [x] **N2/E3（P1）Location 解析改写主机名** — `redirect.rs:165-174` 字符串拼接代替 RFC 3986 解析。实测：`next` → `https://example.comnext/`（主机名变了）、`//evil.com/x` → 拼成本机路径、`HTTPS://` 大写不识别、`?q` 丢失原 path。且文档承诺「非法 Location 原样透传 3xx」，代码却抛错。
   - 修复：`url::Url::join`（这个轮子就在依赖里）。文件：`src/redirect.rs`、`tests/relay.rs` · CC ~20min
@@ -48,20 +52,20 @@
 - [x] **N4/E4（P1）IPv6 字面量目标损坏** — `target.rs:220` 的 `authority()` 不加方括号。实测 `[2606:4700::1]:8080` → `"2606:4700::1:8080"`，Host header 畸形、`full_url()` 非法。
   - 注：Codex 指出「环检测必然错误」是过头说法——畸形串仍是一致的 HashSet key，只是不再是合法 canonical URL。
   - 文件：`src/target.rs`、`src/headers.rs`、`tests/relay.rs` · CC ~15min
-- [ ] **N7（P2）上游 Vary 被删除替换** — `headers.rs:57` 删掉上游全部 `Vary`，再写入 CORS-only 的固定值。`Accept-Encoding`/`Accept-Language` 缓存维度丢失，下游缓存可能跨变体返回错误响应。违反 DESIGN §7「保留缓存控制 headers」。
-  - 修复：追加而非覆盖。 · CC ~10min
-- [ ] **N15/C9（P2）只 dial addrs[0]，无 failover** — 无 Happy Eyeballs、无地址轮换。坏 AAAA 排在可用 A 前面时整站不可用（curl 却能通）。双声道一致认为被低估。
-  - 文件：`src/connector.rs` · CC ~30min
-- [ ] **N6（P2）SHUTDOWN_GRACE 是死配置** — `main.rs:96-108`：`axum::serve(...).await` 已完成，再给瞬时 future 包 timeout，超时永不触发，强退分支不可达。活跃连接可让优雅关闭无限等待，编排系统无法按时终止进程。
-  - 文件：`src/main.rs` · CC ~15min
-- [ ] **E5（P2）未接线的 config knob** — `max_http1_buffer_bytes`/`max_headers_count` 全仓库仅在 `config.rs` 出现，从未传给 hyper server builder。DESIGN §6 文档化的内存防线不存在。接线或删除，二选一。
-  - 文件：`src/config.rs`、`src/main.rs`、`src/app.rs` · CC ~15min
-- [ ] **E9（P3）Proxy-Connection 与通配前缀清理** — `REQUEST_STRIP` 只枚举少量名字，`Proxy-Connection`、`Proxy-*`、`X-Forwarded-Client-Cert` 仍可穿透，与「移除 `Proxy-*`」的声称不一致。
-  - 文件：`src/headers.rs` · CC ~10min
-- [ ] **N13/E10（P3）遥测契约未兑现** — DESIGN §9 要求日志含 scheme/hostname/port/字节计数；`proxy.rs::log_complete` 只有 4 个字段。真正实现契约的 `telemetry::log_request_complete` 与 `RequestLogFields` 是死代码。`log_stream_aborted` 硬编码 `("unknown", …, 0)`。
-  - 文件：`src/proxy.rs`、`src/telemetry.rs`、`src/body_timeout.rs` · CC ~20min
-- [ ] **N14（P3）/healthz 无 CORS headers** — 其他所有响应都带，唯独健康检查没有。
-  - 文件：`src/error.rs` · CC ~2min
+- [x] **N7（P2）上游 Vary 被删除替换** — `headers.rs:57` 删掉上游全部 `Vary`，再写入 CORS-only 的固定值。`Accept-Encoding`/`Accept-Language` 缓存维度丢失，下游缓存可能跨变体返回错误响应。违反 DESIGN §7「保留缓存控制 headers」。
+  - 修复：`RESPONSE_STRIP` 移除 `vary`，`add_cors_headers` 改 `append` 追加 CORS 维度。文件：`src/headers.rs`
+- [x] **N15/C9（P2）只 dial addrs[0]，无 failover** — 无 Happy Eyeballs、无地址轮换。坏 AAAA 排在可用 A 前面时整站不可用（curl 却能通）。双声道一致认为被低估。
+  - 修复：`connect` 按顺序 failover 遍历已验证地址，任一成功即用，全失败返回最后错误；peer_addr 校验移入循环。文件：`src/connector.rs`
+- [x] **N6（P2）SHUTDOWN_GRACE 是死配置** — `main.rs:96-108`：`axum::serve(...).await` 已完成，再给瞬时 future 包 timeout，超时永不触发，强退分支不可达。活跃连接可让优雅关闭无限等待，编排系统无法按时终止进程。
+  - 修复：用 `Notify` 让「关闭已开始」可观察，看门狗只对优雅关闭阶段计时（`select!` + `biased`），超时 `exit(0)`。文件：`src/main.rs`
+- [x] **E5（P2）未接线的 config knob** — `max_http1_buffer_bytes`/`max_headers_count` 全仓库仅在 `config.rs` 出现，从未传给 hyper server builder。DESIGN §6 文档化的内存防线不存在。接线或删除，二选一。
+  - 处理（选删除）：移除两个字段/env 解析 + README 表项，DESIGN §7 改为声明走 hyper 默认值。文件：`src/config.rs`、`README.md`、`DESIGN.md`
+- [x] **E9（P3）Proxy-Connection 与通配前缀清理** — `REQUEST_STRIP` 只枚举少量名字，`Proxy-Connection`、`Proxy-*`、`X-Forwarded-Client-Cert` 仍可穿透，与「移除 `Proxy-*`」的声称不一致。
+  - 修复：`clean_request_headers` 增加 `proxy-` / `x-forwarded-` 前缀通配删除。文件：`src/headers.rs`
+- [x] **N13/E10（P3）遥测契约未兑现** — DESIGN §9 要求日志含 scheme/hostname/port/字节计数；`proxy.rs::log_complete` 只有 4 个字段。真正实现契约的 `telemetry::log_request_complete` 与 `RequestLogFields` 是死代码。`log_stream_aborted` 硬编码 `("unknown", …, 0)`。
+  - 修复：`log_complete` 补 scheme/host/port；`IdleTimeoutBody` 带 request_id + 方向 + 字节计数，流结束/中止记真实值；删除死代码 `RequestLogFields`/`log_request_complete`。文件：`src/proxy.rs`、`src/telemetry.rs`、`src/body_timeout.rs`
+- [x] **N14（P3）/healthz 无 CORS headers** — 其他所有响应都带，唯独健康检查没有。
+  - 修复：`build_healthz_response` 补 `add_cors_headers`。文件：`src/error.rs`
 
 ## 第 4 档 — 产品真实性（立即做，成本极低）
 

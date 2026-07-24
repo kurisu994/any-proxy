@@ -71,8 +71,10 @@ impl AddressPolicy {
     /// 从环境变量 `DENY_CIDRS` 加载额外拒绝 CIDR
     ///
     /// 格式：逗号分隔的 CIDR 列表，例如 `10.0.0.0/8,172.16.0.0/12`。
-    /// 无法解析的条目打印 warn 日志并跳过（不影响启动）。
-    pub fn with_env_deny_cidrs(mut self) -> Self {
+    ///
+    /// **fail-closed**：任一条目非法直接返回 `Err`，由调用方在启动时终止进程。
+    /// 静默跳过会让运维笔误导致整条防护失效，与 fail-closed 产品定位冲突（N12）。
+    pub fn with_env_deny_cidrs(mut self) -> Result<Self, String> {
         if let Ok(val) = std::env::var("DENY_CIDRS") {
             for cidr_str in val.split(',') {
                 let trimmed = cidr_str.trim();
@@ -82,16 +84,12 @@ impl AddressPolicy {
                 match trimmed.parse::<IpNet>() {
                     Ok(cidr) => self.deny_cidrs.push(cidr),
                     Err(e) => {
-                        tracing::warn!(
-                            cidr = trimmed,
-                            error = %e,
-                            "DENY_CIDRS 条目无效，已跳过"
-                        );
+                        return Err(format!("DENY_CIDRS 条目非法 `{trimmed}`: {e}"));
                     }
                 }
             }
         }
-        self
+        Ok(self)
     }
 
     /// 创建允许所有地址的策略（仅供测试使用）
@@ -110,14 +108,18 @@ impl AddressPolicy {
     /// 使用 `if_addrs` 枚举所有网络接口，替换当前 host_addresses。
     /// 通过 `RwLock` 实现并发安全，后台任务可定期调用此方法。
     pub fn refresh_host_addresses(&self) {
-        let mut new_addrs = HashSet::new();
-        if let Ok(ifaces) = if_addrs::get_if_addrs() {
-            for iface in ifaces {
-                new_addrs.insert(iface.ip());
+        // fail-closed：只有成功枚举接口才替换快照。
+        // 枚举失败时保留上一次快照，避免用空集合覆盖后放行宿主公网接口地址（E7）。
+        match if_addrs::get_if_addrs() {
+            Ok(ifaces) => {
+                let new_addrs: HashSet<IpAddr> = ifaces.into_iter().map(|i| i.ip()).collect();
+                if let Ok(mut guard) = self.host_addresses.write() {
+                    *guard = new_addrs;
+                }
             }
-        }
-        if let Ok(mut guard) = self.host_addresses.write() {
-            *guard = new_addrs;
+            Err(e) => {
+                tracing::warn!(error = %e, "枚举宿主网络接口失败，保留上一次快照");
+            }
         }
     }
 
@@ -183,8 +185,11 @@ impl AddressPolicy {
     pub fn validate_all(&self, addresses: &[IpAddr]) -> Result<Vec<IpAddr>, crate::ProxyError> {
         for ip in addresses {
             if !self.is_allowed(ip) {
+                // 被拒 IP 只进内部日志，不回显给调用方：错误消息会明文序列化，
+                // 泄露解析结果等于对外提供 DNS 解析预言机（DESIGN §8，N5）。
+                tracing::debug!(blocked_ip = %ip, "目标地址被地址策略拒绝");
                 return Err(crate::ProxyError::TargetBlocked {
-                    message: format!("目标地址不允许访问: {ip}"),
+                    message: "目标解析到非公网地址，已拒绝".into(),
                 });
             }
         }
@@ -269,6 +274,14 @@ fn default_deny_cidrs() -> Vec<IpNet> {
         "100::/64".parse().unwrap(),
         // 2001:db8::/32 (documentation)
         "2001:db8::/32".parse().unwrap(),
+        // 以下三段虽落在 2000::/3 全局单播白名单内，但会嵌入/转换到 IPv4，
+        // 宿主配置对应路由时可形成条件式 SSRF，必须显式拒绝（E8）：
+        // 6to4 (RFC 3056)：地址内嵌 IPv4，可指向私网
+        "2002::/16".parse().unwrap(),
+        // Teredo (RFC 4380)：隧道封装 IPv4
+        "2001::/32".parse().unwrap(),
+        // ORCHID (RFC 4843，已废弃)：非路由标识符
+        "2001:10::/28".parse().unwrap(),
     ]
 }
 
@@ -484,15 +497,31 @@ mod tests {
         assert!(p.host_addresses_count() > 0);
     }
 
+    // 合并为单个测试：DENY_CIDRS 是进程级全局环境变量，
+    // 拆成两个测试并行执行会相互污染，故顺序断言合法与非法两种情形。
     #[test]
     fn test_with_env_deny_cidrs() {
+        // 合法条目：正常加载
         std::env::set_var("DENY_CIDRS", "1.2.3.0/24, 2001:db8::/32");
-        let p = AddressPolicy::new().with_env_deny_cidrs();
-        std::env::remove_var("DENY_CIDRS");
-
+        let p = AddressPolicy::new().with_env_deny_cidrs().unwrap();
         assert!(!p.is_allowed(&"1.2.3.4".parse().unwrap()));
         assert!(p.is_allowed(&"1.2.4.4".parse().unwrap()));
         assert!(!p.is_allowed(&"2001:db8::1".parse().unwrap()));
+
+        // 非法条目：fail-closed 返回 Err，而非静默跳过（N12）
+        std::env::set_var("DENY_CIDRS", "not-a-cidr");
+        let result = AddressPolicy::new().with_env_deny_cidrs();
+        std::env::remove_var("DENY_CIDRS");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_deny_6to4_teredo_orchid() {
+        let p = policy();
+        // 三段虽在 2000::/3 内，但因内嵌/转换 IPv4 被显式拒绝（E8）
+        assert!(!p.is_allowed(&"2002:c0a8:0101::1".parse().unwrap())); // 6to4 → 192.168.1.1
+        assert!(!p.is_allowed(&"2001:0:4137:9e76::1".parse().unwrap())); // Teredo
+        assert!(!p.is_allowed(&"2001:10::1".parse().unwrap())); // ORCHID
     }
 
     #[test]

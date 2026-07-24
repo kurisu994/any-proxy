@@ -46,7 +46,14 @@ async fn main() {
     );
 
     // 3. 创建 AddressPolicy（spawn_host_refresh 内部会立即刷新一次）
-    let policy = Arc::new(AddressPolicy::new().with_env_deny_cidrs());
+    //    DENY_CIDRS 非法直接终止启动，避免防护静默失效（N12）
+    let policy = match AddressPolicy::new().with_env_deny_cidrs() {
+        Ok(p) => Arc::new(p),
+        Err(e) => {
+            eprintln!("配置错误: {e}");
+            std::process::exit(1);
+        }
+    };
 
     // 启动宿主接口定期刷新（立即刷新一次 + 每 60s 刷新）
     let _refresh_handle = policy.spawn_host_refresh(config.host_refresh_interval);
@@ -84,30 +91,42 @@ async fn main() {
 
     tracing::info!("监听 {}", config.listen_addr);
 
-    let shutdown = shutdown_signal();
-
-    // Axum 的 with_graceful_shutdown 在 shutdown future 返回后
-    // 停止接收新连接并等待活跃连接完成。
-    let serve_result = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await;
-
-    // grace 超时后强制退出
     let grace = config.shutdown_grace;
-    let force_exit = tokio::time::timeout(grace, async {
-        if let Err(e) = serve_result {
-            tracing::error!("服务器错误: {e}");
-            std::process::exit(1);
+
+    // `shutdown_started` 让「优雅关闭已开始」可被外部看门狗观察。
+    // 关键点：axum 的 graceful future 在收到信号前一直挂起，只有进入
+    // 「等待活跃连接」阶段后才可能无限阻塞。因此不能对整个 serve 套 timeout
+    // （会误杀正常服务），而要让看门狗只对关闭阶段计时（N6）。
+    let shutdown_started = Arc::new(tokio::sync::Notify::new());
+
+    let server = axum::serve(listener, app).with_graceful_shutdown({
+        let started = shutdown_started.clone();
+        async move {
+            shutdown_signal().await;
+            started.notify_waiters();
         }
-    })
-    .await;
+    });
 
-    if force_exit.is_err() {
-        tracing::warn!("优雅关闭超时（{grace:?}），强制退出");
-        std::process::exit(0);
+    // 强退看门狗：关闭一旦开始，最多再等 grace，超时仍未退出就强制退出。
+    let watchdog = async move {
+        shutdown_started.notified().await;
+        tokio::time::sleep(grace).await;
+    };
+
+    tokio::select! {
+        biased;
+        result = server => {
+            if let Err(e) = result {
+                tracing::error!("服务器错误: {e}");
+                std::process::exit(1);
+            }
+            tracing::info!("any-proxy 已关闭");
+        }
+        _ = watchdog => {
+            tracing::warn!("优雅关闭超时（{grace:?}），强制退出");
+            std::process::exit(0);
+        }
     }
-
-    tracing::info!("any-proxy 已关闭");
 }
 
 /// 容器健康检查：连接本机监听端口发起一次 `GET /healthz`
