@@ -7,6 +7,7 @@
 - `src/main.rs`：进程入口、配置加载、宿主接口刷新调度与 SIGTERM 优雅关闭。
 - `src/app.rs`：Axum Router 组装。
 - `src/concurrency.rs`：进程级并发上限；permit 挂在响应 Body 上，流结束才释放，饱和时返回 503。
+- `src/body_timeout.rs`：逐 frame idle timeout 的 Body 包装，防止慢速流长期占用连接。
 - `src/proxy.rs`：核心代理编排，集成 Connector、重定向状态机与流式 Body 桥接。
 - `src/config.rs`：环境变量解析、校验与 typed Config。
 - `src/headers.rs`：请求/响应 header 清理与 CORS 预检/响应头。
@@ -32,15 +33,15 @@
 ```bash
 cargo build
 cargo fmt --check
-cargo clippy -- -D warnings
+cargo clippy --all-targets -- -D warnings
 cargo test
 cargo run --release
 ```
 
 - `cargo build`：编译 library、binary 和依赖，适合完成一组修改后的快速验证。
 - `cargo fmt --check`：检查 Rustfmt 格式，不修改文件；需要修复时运行 `cargo fmt`。
-- `cargo clippy --all-targets -- -D warnings`：运行静态检查。注意 CI 当前未加 `--all-targets`，测试代码的 lint 不会被拦截（见 TODOS 第 7 档）。
-- `cargo test`：运行全部测试，当前共 126 个（另有 1 个默认 ignore 的 35 秒长传输回归，用 `cargo test --test concurrency -- --ignored` 手动跑）。
+- `cargo clippy --all-targets -- -D warnings`：运行静态检查；CI 已加 `--all-targets`，测试代码的 lint 同样会被拦截。
+- `cargo test`：运行全部测试，当前共 140 个（其中 1 个默认 ignore 的 35 秒长传输回归，用 `cargo test --test concurrency -- --ignored` 手动跑）。
 - `cargo test <test_name>`：只运行指定测试，适合开发时快速反馈。
 - `cargo test --test integration`：只运行 Connector 集成测试。
 - `cargo test --test tls_spike`：只运行 TLS fixture 测试。
@@ -78,15 +79,13 @@ cargo run --release
 
 优先使用本地、确定性的 fixture 和注入式假 `Resolver`/`Dialer`，不要让默认测试依赖公网 DNS 或第三方服务。安全修复至少覆盖成功路径、拒绝路径和"未发生 dial"的断言。仓库目前没有数值覆盖率门槛；覆盖关键安全分支比追求行覆盖率更重要。
 
-## Commit 与 Pull Request 指南
+## Commit 指南
 
-现有历史采用中文 Conventional Commits：`类型(可选范围): 动词开头的主题`，例如 `feat(M1): 实现完整 Relay 代理服务`、`fix(M0): 处理代码评审发现项`、`docs: 补充安全流水线`。常用类型包括 `feat`、`fix`、`docs`、`test`、`refactor`、`chore`；提交应聚焦单一目的，不附加生成工具或共同作者署名。
+本仓库直接在 `main` 分支提交，不新建功能分支、不走 Pull Request 流程；push 到 `main` 会触发 CI（fmt + clippy + test）。
 
-Pull Request 应包含：
+现有历史采用中文 Conventional Commits：`类型(可选范围): 动词开头的主题`，例如 `feat(M1): 实现完整 Relay 代理服务`、`fix(M0): 处理代码评审发现项`、`docs: 补充安全流水线`。常用类型包括 `feat`、`fix`、`docs`、`test`、`refactor`、`chore`；提交应聚焦单一目的，不附加生成工具或共同作者署名。涉及安全边界、公开 API、错误码、依赖或配置的变更，在 commit 正文用 1-5 条说明"做了什么"和"为什么做"。
 
-- 变更目的、主要实现和不做什么；有关联 issue 时使用链接或关闭语句。
-- 对安全边界、公开 API、错误码、依赖或配置的影响；无影响也应明确说明。
-- 实际执行的验证命令及结果；公网手动测试需注明环境。
-- 行为变化对应的测试。只有涉及可视化文档或未来 UI 时才要求截图。
+提交前自查：
 
-发起 PR 前确认工作树不含无关文件，并确保 `cargo fmt --check`、`cargo clippy -- -D warnings`、`cargo test` 全部通过。
+- 工作树不含无关文件，行为变化已补上对应测试。
+- 本地跑通 `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test`（与 CI 门槛一致），推 `main` 前确保三项全绿。
