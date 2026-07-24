@@ -12,7 +12,7 @@ categories = ["web-programming", "network-programming"]
 [dependencies]
 # === M0 核心依赖 ===
 # 异步 runtime
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "io-util", "sync"] }
 # URL 解析
 url = "2"
 # CIDR 匹配
@@ -47,8 +47,6 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 # Body 桥接
 http-body-util = "0.1"
 futures-util = { version = "0.3", default-features = false }
-# 服务层
-tower = { version = "0.5", features = ["limit", "timeout", "util"] }
 
 [dev-dependencies]
 # 测试用

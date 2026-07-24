@@ -226,10 +226,16 @@ where
                     message: format!("HTTP 握手失败: {e}"),
                 })?;
 
-        // 驱动连接（带连接池空闲超时，超时后自动关闭）
-        let pool_idle = state.config.pool_idle_timeout;
+        // 驱动连接直到自然结束。
+        //
+        // 这里**不能**再包一层总时长 timeout：连接 future 覆盖整个请求，
+        // 给它设总上限等于给「任何一次代理传输」设总上限，
+        // 会把持续有数据流动的长下载/长上传静默截断（客户端拿到 200 + 半截 body）。
+        // 卡死场景由 body_timeout 的逐 frame idle timeout 兜底；
+        // 连接任务的总量由 concurrency::limit_concurrency 的 permit 兜底
+        // （permit 持有到响应 Body 结束，覆盖整个流的生命周期）。
         tokio::spawn(async move {
-            let _ = tokio::time::timeout(pool_idle, connection).await;
+            let _ = connection.await;
         });
 
         // 构建上游请求

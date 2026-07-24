@@ -444,9 +444,10 @@ async fn test_response_body_idle_timeout() {
     // 创建短 idle timeout 配置的代理
     let policy = AddressPolicy::allow_all_for_test();
     let connector = Arc::new(Connector::new(LoopbackResolver, policy, TcpDialer::new()));
-    let mut config = Config::default();
-    config.upstream_body_idle_timeout = std::time::Duration::from_secs(1);
-    let config = Arc::new(config);
+    let config = Arc::new(Config {
+        upstream_body_idle_timeout: std::time::Duration::from_secs(1),
+        ..Default::default()
+    });
     let app = create_app(connector, config);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_port = listener.local_addr().unwrap().port();
