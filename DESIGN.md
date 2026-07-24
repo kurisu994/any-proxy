@@ -127,6 +127,7 @@ deny 列表覆盖：私网、链路本地（含云元数据 `169.254.169.254`）
 - `ALLOW_TARGETS`（目标 host allowlist，支持后缀匹配）、`ALLOW_PORTS`（端口 allowlist）
 - `ALLOW_ORIGINS`（Origin allowlist，命中回显具体 origin 并加 `Vary: Origin`，否则 403）
 - `AUTH_TOKEN`（共享令牌，走 `X-Proxy-Token`，转发前删除）
+- `MAX_EGRESS_BYTES` / `RATE_LIMIT_RPS`（全局出口字节预算与令牌桶限速，为带宽账单与请求洪水兜底；批次 2）
 - **启动 gate**：非 loopback 监听且未配置任何上述防护、也未设 `PUBLIC_MODE=1` 时拒绝启动，堵住无意识公网暴露。
 
 > **对 ADR Premise 3 的修正**：原 EUREKA「放弃调用方访问控制」只对**依赖调用方身份**的手段（per-user token）成立——纯前端存不住长期密钥。但 `ALLOW_TARGETS` 与全局流量预算**不看调用方是谁**，不受该前提制约，因此纳入 C1。此修正不推翻「匿名默认、additive」的 UC-1 决定，只新增 gate 与不依赖身份的收紧手段。
@@ -166,6 +167,7 @@ deny 列表覆盖：私网、链路本地（含云元数据 `169.254.169.254`）
 - 达到上限时**立即返回 `503 service_overloaded`**，不排队：调用方需要知道「过载」而不是看到「卡死」。
 - HTTP/1 解析层的 buffer 与 header 数量上限使用 hyper 默认值，不额外暴露配置。
 - 失败连接按解析出的地址顺序 failover，直到成功或耗尽全部候选地址。
+- 可选的 `MAX_EGRESS_BYTES`（全局累计出口字节软上限，准入时检查、body 逐 frame 累加）与 `RATE_LIMIT_RPS`（令牌桶限速）为带宽账单与请求洪水兜底；默认关，详见 §4 C1。
 - 首版禁用所有自动 retry。
 
 > 设计说明：早期版本给整个连接 future 包了一层总时长 timeout（`POOL_IDLE_TIMEOUT`），
@@ -187,8 +189,9 @@ deny 列表覆盖：私网、链路本地（含云元数据 `169.254.169.254`）
 | 401 | `unauthorized` |
 | 403 | `target_blocked` |
 | 405 | `method_not_allowed` |
+| 429 | `rate_limited` |
 | 502 | `dns_failed` / `connect_failed` / `upstream_failed` |
-| 503 | `service_overloaded` |
+| 503 | `service_overloaded` / `budget_exceeded` |
 | 504 | `connect_timeout` / `upstream_timeout` |
 
 上游返回的合法 4xx/5xx 按 Relay 语义原样转发，不转成代理 JSON 错误。

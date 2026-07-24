@@ -82,8 +82,9 @@
   - 决策（不推翻 UC-1「匿名默认」）：新增启动 gate（非 loopback 监听 + 零防护 → 拒绝启动）；纳入 `ALLOW_TARGETS`/`ALLOW_PORTS`/`ALLOW_ORIGINS`/`AUTH_TOKEN`（走 `X-Proxy-Token`，转发前删除）；修正 Premise 3（区分「调用方身份鉴权」与「目标/预算控制」）。
   - 实现：`config.rs`（字段+解析+`target_allowed`/`port_allowed`/`origin_allowed`）、`lib.rs`（`401 unauthorized`）、`main.rs`（`should_gate_startup`+单测）、`proxy.rs`（校验+Origin 回显）、`headers.rs`（strip `X-Proxy-Token`）。测试：config 单测 + relay 端到端 3 组（auth/target/origin）。文档：README/DESIGN 同步。
   - ⏳ **批次 2** = 下面的「字节与时长预算」，单独排。
-- [ ] **C1 批次 2（P2）字节与时长预算** — 请求/响应字节上限、全局每日出口预算、per-client 限速。Codex：「流式传输解决内存，不解决带宽账单」。原 DESIGN 把这些排除在外，但无任何预算意味着带宽耗尽风险没有技术兜底。已在拍板中同意纳入，本轮只交付批次 1。
-  - 文件：`src/config.rs`、`src/proxy.rs`（可新增 `budget.rs`）· CC ~2h
+- [x] **C1 批次 2（P2）字节与时长预算** — 全局出口字节预算 + 令牌桶限速，为带宽账单兜底（Codex：「流式传输解决内存，不解决带宽账单」）。
+  - 实现：新增 `budget.rs`（`Budget` + `TokenBucket`）；config 加 `MAX_EGRESS_BYTES`/`RATE_LIMIT_RPS`；`ProxyState` 注入 `Budget`，proxy 准入检查（429/503）；`body_timeout` 逐 frame 把请求体+响应体出口字节累加进预算；新增 `429 rate_limited`/`503 budget_exceeded` 错误码。测试：budget 单测 3 + relay 端到端 2（限速/预算）。文档：README/DESIGN 同步。
+  - 说明：出口预算为进程累计软上限（准入时检查，重启重置），未做每日窗口；`per-client` 限速在匿名模型下无稳定 client 身份，故做全局限速。
 - [ ] **C4（P2）abuse kill-switch** — 进程级滥用熔断开关 + 运营手段。
   - ⚠️ Codex 指出原 ~1h 估算不可信：它同时覆盖 kill-switch、带宽预算和部署体验，且未定义预算维度、触发行为与恢复流程。需要先拆解。
   - 文件：`.github/workflows/`、`src/telemetry.rs`、`src/config.rs` · CC 待重估

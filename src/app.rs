@@ -28,9 +28,15 @@ where
     R: Resolver + Clone + Send + Sync + 'static,
     D: Dialer + Clone + Send + Sync + 'static,
 {
+    let budget = Arc::new(crate::budget::Budget::new(
+        config.max_egress_bytes,
+        config.rate_limit_rps,
+    ));
+
     let state = ProxyState {
         connector,
         config: config.clone(),
+        budget,
     };
 
     let semaphore = Arc::new(Semaphore::new(config.max_concurrent_requests));

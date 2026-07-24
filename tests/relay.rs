@@ -709,3 +709,64 @@ async fn test_origin_allowlist() {
 
     server.shutdown();
 }
+
+/// 测试 19: 全局限速端到端（C1 批次 2）
+///
+/// rps=1：首个请求通过，紧接着的第二个请求令牌耗尽返回 429。
+#[tokio::test]
+async fn test_rate_limit_end_to_end() {
+    let server = fixture::RecordingServer::start(vec![
+        fixture::CannedResponse::ok("a"),
+        fixture::CannedResponse::ok("b"),
+    ])
+    .await;
+    let port = server.addr.port();
+    let proxy_path = format!("/http://127.0.0.1:{port}/");
+    let config = Config {
+        rate_limit_rps: Some(1),
+        ..Default::default()
+    };
+    let (proxy_port, _h) = start_proxy_with_config(config).await;
+
+    let r1 = http_get(proxy_port, &proxy_path).await;
+    assert!(r1.contains("200"), "首个请求应通过: {r1}");
+    let r2 = http_get(proxy_port, &proxy_path).await;
+    assert!(r2.contains("429"), "第二个请求应被限速 429: {r2}");
+    assert!(r2.contains("rate_limited"), "错误码应为 rate_limited: {r2}");
+
+    server.shutdown();
+}
+
+/// 测试 20: 全局出口预算端到端（C1 批次 2）
+///
+/// 预算 5 字节：首个请求出口 11 字节耗尽预算，第二个请求准入时被拒 503。
+#[tokio::test]
+async fn test_egress_budget_end_to_end() {
+    let server = fixture::RecordingServer::start(vec![
+        fixture::CannedResponse::ok("hello world"), // 11 字节
+        fixture::CannedResponse::ok("second"),
+    ])
+    .await;
+    let port = server.addr.port();
+    let proxy_path = format!("/http://127.0.0.1:{port}/");
+    let config = Config {
+        max_egress_bytes: Some(5),
+        ..Default::default()
+    };
+    let (proxy_port, _h) = start_proxy_with_config(config).await;
+
+    // 首个请求准入时 used=0 < 5，通过；读完 body 后 used=11
+    let r1 = http_get(proxy_port, &proxy_path).await;
+    assert!(r1.contains("200"), "首个请求应通过: {r1}");
+    assert!(r1.contains("hello world"), "应返回完整 body: {r1}");
+
+    // 第二个请求准入时 used=11 >= 5 → 503
+    let r2 = http_get(proxy_port, &proxy_path).await;
+    assert!(r2.contains("503"), "预算耗尽后应 503: {r2}");
+    assert!(
+        r2.contains("budget_exceeded"),
+        "错误码应为 budget_exceeded: {r2}"
+    );
+
+    server.shutdown();
+}

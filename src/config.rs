@@ -28,6 +28,10 @@ pub struct Config {
     pub allow_ports: Vec<u16>,
     /// 公网监听确认开关：非 loopback 监听且无任何防护时需显式开启
     pub public_mode: bool,
+    /// 全局累计出口字节上限（None=不限）；达到后拒绝新请求（C1 批次 2）
+    pub max_egress_bytes: Option<u64>,
+    /// 全局请求速率上限 rps（None=不限）；令牌桶
+    pub rate_limit_rps: Option<u32>,
     /// DNS 解析超时
     pub dns_timeout: Duration,
     /// TCP 连接超时
@@ -57,6 +61,8 @@ impl Default for Config {
             auth_token: None,
             allow_ports: Vec::new(),
             public_mode: false,
+            max_egress_bytes: None,
+            rate_limit_rps: None,
             dns_timeout: Duration::from_secs(5),
             connect_timeout: Duration::from_secs(10),
             tls_timeout: Duration::from_secs(10),
@@ -112,6 +118,9 @@ impl Config {
         config.auth_token = env_str("AUTH_TOKEN");
         config.allow_ports = env_ports("ALLOW_PORTS")?;
         config.public_mode = env_bool("PUBLIC_MODE");
+        config.max_egress_bytes = env_opt_u64("MAX_EGRESS_BYTES")?;
+        config.rate_limit_rps =
+            env_opt_u64("RATE_LIMIT_RPS")?.map(|v| v.min(u32::MAX as u64) as u32);
 
         config.dns_timeout = env_duration("DNS_TIMEOUT", config.dns_timeout, 1, 300)?;
         config.connect_timeout = env_duration("CONNECT_TIMEOUT", config.connect_timeout, 1, 300)?;
@@ -227,6 +236,22 @@ fn env_bool(key: &str) -> bool {
     match env_str(key) {
         Some(s) => matches!(s.to_lowercase().as_str(), "1" | "true" | "yes" | "on"),
         None => false,
+    }
+}
+
+/// 读取可选正整数环境变量（未设=None，值必须 >0，非法 fail-closed）
+fn env_opt_u64(key: &str) -> Result<Option<u64>, ConfigError> {
+    match env_str(key) {
+        Some(s) => {
+            let v: u64 = s
+                .parse()
+                .map_err(|e| ConfigError::new(key, format!("无效整数: {e}")))?;
+            if v == 0 {
+                return Err(ConfigError::new(key, "值必须为正".into()));
+            }
+            Ok(Some(v))
+        }
+        None => Ok(None),
     }
 }
 

@@ -39,22 +39,26 @@ pub struct IdleTimeoutBody<B> {
     bytes: u64,
     /// 是否已记过终态日志，避免重复
     finished: bool,
+    /// 全局出口预算（配置后逐 frame 累加出口字节）
+    budget: Option<std::sync::Arc<crate::budget::Budget>>,
 }
 
 impl<B> IdleTimeoutBody<B> {
-    /// 创建 idle timeout body（不带遥测上下文，主要供测试使用）
+    /// 创建 idle timeout body（不带遥测上下文与预算，主要供测试使用）
     pub fn new(inner: B, timeout: Duration) -> Self {
-        Self::with_context(inner, timeout, Arc::from("-"), "stream")
+        Self::with_context(inner, timeout, Arc::from("-"), "stream", None)
     }
 
     /// 创建带遥测上下文的 idle timeout body
     ///
-    /// `request_id` 关联到 handler 的完成日志，`direction` 标记上传/下载方向。
+    /// `request_id` 关联到 handler 的完成日志，`direction` 标记上传/下载方向，
+    /// `budget` 配置后逐 frame 把出口字节计入全局预算。
     pub fn with_context(
         inner: B,
         timeout: Duration,
         request_id: Arc<str>,
         direction: &'static str,
+        budget: Option<std::sync::Arc<crate::budget::Budget>>,
     ) -> Self {
         Self {
             inner,
@@ -64,6 +68,7 @@ impl<B> IdleTimeoutBody<B> {
             direction,
             bytes: 0,
             finished: false,
+            budget,
         }
     }
 
@@ -130,7 +135,11 @@ where
                     this.reset_sleep();
 
                     if let Some(data) = frame.data_ref() {
-                        this.bytes += data.remaining() as u64;
+                        let n = data.remaining() as u64;
+                        this.bytes += n;
+                        if let Some(b) = &this.budget {
+                            b.add_egress(n);
+                        }
                         return Poll::Ready(Some(Ok(frame)));
                     }
 
@@ -183,22 +192,26 @@ pub fn wrap_response_body(
     body: hyper::body::Incoming,
     timeout: Duration,
     request_id: Arc<str>,
+    budget: Arc<crate::budget::Budget>,
 ) -> axum::body::Body {
     use http_body_util::BodyExt;
-    let wrapped = IdleTimeoutBody::with_context(body, timeout, request_id, "download");
+    let wrapped =
+        IdleTimeoutBody::with_context(body, timeout, request_id, "download", Some(budget));
     axum::body::Body::new(wrapped.map_err(axum::Error::new))
 }
 
 /// 将 idle timeout 应用于上传请求 body，返回 Axum `Body`
 ///
-/// 使用 `UPLOAD_IDLE_TIMEOUT` 配置。`request_id` 用于流中止/完成日志。
+/// 使用 `UPLOAD_IDLE_TIMEOUT` 配置。`request_id` 用于流中止/完成日志，
+/// `budget` 把上传出口字节计入全局预算。
 pub fn wrap_request_body(
     body: axum::body::Body,
     timeout: Duration,
     request_id: Arc<str>,
+    budget: Arc<crate::budget::Budget>,
 ) -> axum::body::Body {
     use http_body_util::BodyExt;
-    let wrapped = IdleTimeoutBody::with_context(body, timeout, request_id, "upload");
+    let wrapped = IdleTimeoutBody::with_context(body, timeout, request_id, "upload", Some(budget));
     axum::body::Body::new(wrapped.map_err(axum::Error::new))
 }
 

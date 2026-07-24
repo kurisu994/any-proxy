@@ -12,6 +12,7 @@
 
 pub mod app;
 pub mod body_timeout;
+pub mod budget;
 pub mod concurrency;
 pub mod config;
 pub mod connector;
@@ -51,6 +52,14 @@ pub enum ProxyError {
     ///
     /// 配置 `AUTH_TOKEN` 后，请求未带正确 `X-Proxy-Token` 时返回。
     Unauthorized,
+    /// 请求速率超过全局上限（HTTP 429）
+    ///
+    /// 配置 `RATE_LIMIT_RPS` 后，令牌桶耗尽时返回。
+    RateLimited,
+    /// 全局出口字节预算耗尽（HTTP 503）
+    ///
+    /// 配置 `MAX_EGRESS_BYTES` 后，累计出口字节达到上限时返回。
+    BudgetExceeded,
 }
 
 impl ProxyError {
@@ -66,6 +75,8 @@ impl ProxyError {
             Self::UpstreamTimeout => "upstream_timeout",
             Self::ServiceOverloaded => "service_overloaded",
             Self::Unauthorized => "unauthorized",
+            Self::RateLimited => "rate_limited",
+            Self::BudgetExceeded => "budget_exceeded",
         }
     }
 
@@ -80,6 +91,8 @@ impl ProxyError {
             Self::ConnectTimeout | Self::UpstreamTimeout => 504,
             Self::ServiceOverloaded => 503,
             Self::Unauthorized => 401,
+            Self::RateLimited => 429,
+            Self::BudgetExceeded => 503,
         }
     }
 
@@ -95,6 +108,8 @@ impl ProxyError {
             Self::UpstreamTimeout => "上游响应超时",
             Self::ServiceOverloaded => "服务并发已达上限，请稍后重试",
             Self::Unauthorized => "缺少或无效的代理令牌",
+            Self::RateLimited => "请求过于频繁，请稍后重试",
+            Self::BudgetExceeded => "全局出口预算已耗尽",
         }
     }
 }

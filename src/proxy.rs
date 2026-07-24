@@ -38,6 +38,7 @@ use crate::telemetry;
 pub struct ProxyState<R, D> {
     pub connector: Arc<Connector<R, D>>,
     pub config: Arc<Config>,
+    pub budget: Arc<crate::budget::Budget>,
 }
 
 impl<R, D> Clone for ProxyState<R, D> {
@@ -45,6 +46,7 @@ impl<R, D> Clone for ProxyState<R, D> {
         Self {
             connector: self.connector.clone(),
             config: self.config.clone(),
+            budget: self.budget.clone(),
         }
     }
 }
@@ -211,11 +213,27 @@ where
         return resp;
     }
 
-    // 对上传 body 应用 idle timeout
+    // C1 批次 2：准入检查（限速 429 + 出口预算 503），只对真正转发的请求生效
+    if let Err(e) = state.budget.check_admission() {
+        let code = e.code();
+        let resp = error::build_error_response(&e, &request_id);
+        log_complete(
+            &request_id,
+            &method,
+            &resp,
+            start,
+            Some(code),
+            Some(&target),
+        );
+        return resp;
+    }
+
+    // 对上传 body 应用 idle timeout（并把出口字节计入全局预算）
     let body = body_timeout::wrap_request_body(
         body,
         state.config.upload_idle_timeout,
         Arc::from(request_id.as_str()),
+        state.budget.clone(),
     );
 
     // 执行代理请求（含重定向跟随）
@@ -390,13 +408,23 @@ where
                 }
                 RedirectAction::PassThrough => {
                     // 原样返回 3xx
-                    return build_proxy_response(response, &state.config, Arc::from(request_id));
+                    return build_proxy_response(
+                        response,
+                        &state.config,
+                        Arc::from(request_id),
+                        state.budget.clone(),
+                    );
                 }
             }
         }
 
         // 非重定向，返回响应
-        return build_proxy_response(response, &state.config, Arc::from(request_id));
+        return build_proxy_response(
+            response,
+            &state.config,
+            Arc::from(request_id),
+            state.budget.clone(),
+        );
     }
 }
 
@@ -405,6 +433,7 @@ fn build_proxy_response(
     response: hyper::Response<hyper::body::Incoming>,
     config: &Config,
     request_id: Arc<str>,
+    budget: Arc<crate::budget::Budget>,
 ) -> Result<Response, crate::ProxyError> {
     let (mut parts, body) = response.into_parts();
 
@@ -412,9 +441,13 @@ fn build_proxy_response(
     headers::clean_response_headers(&mut parts.headers);
     headers::add_cors_headers(&mut parts.headers);
 
-    // 应用逐 frame idle timeout 到响应 body
-    let axum_body =
-        body_timeout::wrap_response_body(body, config.upstream_body_idle_timeout, request_id);
+    // 应用逐 frame idle timeout 到响应 body（并把出口字节计入全局预算）
+    let axum_body = body_timeout::wrap_response_body(
+        body,
+        config.upstream_body_idle_timeout,
+        request_id,
+        budget,
+    );
 
     Ok(Response::from_parts(parts, axum_body))
 }

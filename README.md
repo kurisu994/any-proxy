@@ -106,7 +106,7 @@ any-proxy 的安全边界完全在**目标地址校验**：
 - 容器无法自动发现 NAT hairpin 对应的宿主公网地址，需通过 `DENY_CIDRS` 补充
 - 宿主接口地址每 60 秒刷新，网络配置变化后最多 60 秒竞态窗口
 - 默认允许任意公共端口 1-65535，实例可被用于端口扫描（可用 `ALLOW_PORTS` 收紧到 `80,443`）
-- 公网匿名无额度控制的风险没有技术消除（`ALLOW_TARGETS` / `AUTH_TOKEN` 可收紧访问面，但全局流量预算属批次 2 未做）
+- 公网匿名无额度控制的风险没有技术消除（可用 `ALLOW_TARGETS` / `AUTH_TOKEN` 收紧访问面，`MAX_EGRESS_BYTES` / `RATE_LIMIT_RPS` 为带宽账单兜底）
 - 新分配的 IANA IPv4 特殊用途段在补进 deny 列表前会被放行
 
 > 完整的已知偏差清单见 [DESIGN.md 第 10 节](DESIGN.md#10-已知偏差汇总)。
@@ -126,6 +126,8 @@ any-proxy 的安全边界完全在**目标地址校验**：
 | `AUTH_TOKEN` | (空) | 共享代理令牌；配置后请求需带 `X-Proxy-Token`，否则 401 |
 | `ALLOW_PORTS` | (空) | 目标端口 allowlist，逗号分隔；空=不限（1-65535） |
 | `PUBLIC_MODE` | false | 显式确认公网匿名开放；非 loopback 监听且无其它防护时必须开启才允许启动 |
+| `MAX_EGRESS_BYTES` | (空) | 全局累计出口字节上限；达到后新请求返回 `503 budget_exceeded`（进程重启重置） |
+| `RATE_LIMIT_RPS` | (空) | 全局请求速率上限（令牌桶）；超过返回 `429 rate_limited` |
 | `DNS_TIMEOUT` | 5s | DNS 解析超时 |
 | `CONNECT_TIMEOUT` | 10s | TCP 连接超时 |
 | `TLS_TIMEOUT` | 10s | TLS 握手超时 |
@@ -155,6 +157,8 @@ LISTEN_ADDR=127.0.0.1:8080 ./any-proxy
 
 > 说明：`ALLOW_TARGETS` 与 `ALLOW_PORTS` 不依赖调用方身份，是最有效的收紧手段；`X-Proxy-Token` 在转发前会被删除，不会泄漏给上游；纯前端场景令牌对终端用户可见，价值有限。
 
+**流量兜底**：`MAX_EGRESS_BYTES`（全局累计出口字节上限，进程重启重置）与 `RATE_LIMIT_RPS`（全局令牌桶限速）为带宽账单提供技术兜底，同样默认关、不依赖调用方身份。出口字节统计请求体与响应体两个方向。
+
 ## HTTP 接口
 
 | 路径 | 方法 | 说明 |
@@ -174,11 +178,13 @@ LISTEN_ADDR=127.0.0.1:8080 ./any-proxy
 | `invalid_target` | 400 | URL 非法、带 userinfo、端口越界、URI 超长 | 检查代理前缀后的目标 URL 格式 |
 | `unauthorized` | 401 | 配置 `AUTH_TOKEN` 后缺少/错误的 `X-Proxy-Token` | 请求带上正确的 `X-Proxy-Token` header |
 | `target_blocked` | 403 | 目标非公网/降级，或不在 `ALLOW_TARGETS`/`ALLOW_PORTS`/`ALLOW_ORIGINS` | 确认目标合规；检查 allowlist 配置 |
+| `rate_limited` | 429 | 请求速率超过 `RATE_LIMIT_RPS` | 降低请求频率或上调速率上限 |
 | `method_not_allowed` | 405 | 使用了 CONNECT/TRACE 等不支持的方法 | 仅用 GET/HEAD/POST/PUT/PATCH/DELETE/OPTIONS |
 | `dns_failed` | 502 | 域名无法解析或返回空答案 | 确认域名可解析；检查代理所在网络 DNS |
 | `connect_failed` | 502 | 所有候选地址 TCP/TLS 均失败 | 目标端口是否开放；TLS 证书是否可信 |
 | `upstream_failed` | 502 | 上游 HTTP 协议错误 | 确认目标返回合法 HTTP |
 | `service_overloaded` | 503 | 活跃传输数达 `MAX_CONCURRENT_REQUESTS` | 稍后重试；或上调并发上限 / 扩容 |
+| `budget_exceeded` | 503 | 累计出口字节达 `MAX_EGRESS_BYTES` | 重启重置计数；或上调预算 |
 | `connect_timeout` | 504 | DNS / TCP / TLS 阶段超时 | 目标是否慢；按需上调 `DNS_TIMEOUT` / `CONNECT_TIMEOUT` / `TLS_TIMEOUT` |
 | `upstream_timeout` | 504 | 等待上游响应头超时 | 上调 `UPSTREAM_HEADERS_TIMEOUT` |
 
