@@ -34,7 +34,8 @@ jobs:
         run: cargo fmt --check
 
       - name: cargo clippy
-        run: cargo clippy -- -D warnings
+        # --all-targets 让 clippy 覆盖 tests/，否则测试代码的 lint 不会被拦截
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: cargo test
         run: cargo test

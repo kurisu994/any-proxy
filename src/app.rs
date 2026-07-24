@@ -5,13 +5,15 @@
 //! 路由：
 //! - 所有请求由 `proxy_handler` 统一处理
 //! - `proxy_handler` 内部根据路径分发到 healthz、首页、预检或代理转发
-//! - 并发上限由 Tower `ConcurrencyLimitLayer` 在解析 Body 前获取 permit
+//! - 并发上限由 `concurrency::limit_concurrency` 在进入 handler 前获取 permit，
+//!   并把 permit 挂到响应 Body 上，直到流结束才释放（见 `crate::concurrency`）
 
 use std::sync::Arc;
 
 use axum::Router;
-use tower::limit::concurrency::ConcurrencyLimitLayer;
+use tokio::sync::Semaphore;
 
+use crate::concurrency::limit_concurrency;
 use crate::config::Config;
 use crate::connector::{Connector, Dialer};
 use crate::proxy::{proxy_handler, ProxyState};
@@ -31,8 +33,13 @@ where
         config: config.clone(),
     };
 
+    let semaphore = Arc::new(Semaphore::new(config.max_concurrent_requests));
+
     Router::new()
         .fallback(proxy_handler)
-        .layer(ConcurrencyLimitLayer::new(config.max_concurrent_requests))
+        .layer(axum::middleware::from_fn_with_state(
+            semaphore,
+            limit_concurrency,
+        ))
         .with_state(state)
 }

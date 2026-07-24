@@ -34,8 +34,6 @@ pub struct Config {
     pub upload_idle_timeout: Duration,
     /// 上游响应 body 空闲读取超时
     pub upstream_body_idle_timeout: Duration,
-    /// 连接池空闲超时
-    pub pool_idle_timeout: Duration,
     /// 优雅关闭等待时间
     pub shutdown_grace: Duration,
     /// 宿主接口地址刷新间隔
@@ -56,7 +54,6 @@ impl Default for Config {
             upstream_headers_timeout: Duration::from_secs(30),
             upload_idle_timeout: Duration::from_secs(30),
             upstream_body_idle_timeout: Duration::from_secs(60),
-            pool_idle_timeout: Duration::from_secs(30),
             shutdown_grace: Duration::from_secs(30),
             host_refresh_interval: Duration::from_secs(60),
         }
@@ -127,8 +124,6 @@ impl Config {
             1,
             3600,
         )?;
-        config.pool_idle_timeout =
-            env_duration("POOL_IDLE_TIMEOUT", config.pool_idle_timeout, 1, 3600)?;
         config.shutdown_grace = env_duration("SHUTDOWN_GRACE", config.shutdown_grace, 1, 300)?;
         config.host_refresh_interval = env_duration(
             "HOST_REFRESH_INTERVAL",

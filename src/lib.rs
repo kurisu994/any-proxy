@@ -12,6 +12,7 @@
 
 pub mod app;
 pub mod body_timeout;
+pub mod concurrency;
 pub mod config;
 pub mod connector;
 pub mod error;
@@ -42,6 +43,10 @@ pub enum ProxyError {
     ConnectTimeout,
     /// 响应 headers 前超时（HTTP 504）
     UpstreamTimeout,
+    /// 进程级并发已达上限（HTTP 503）
+    ///
+    /// 饱和时立即拒绝而不是排队：调用方需要知道「过载」而不是看到「卡死」。
+    ServiceOverloaded,
 }
 
 impl ProxyError {
@@ -55,6 +60,7 @@ impl ProxyError {
             Self::UpstreamFailed { .. } => "upstream_failed",
             Self::ConnectTimeout => "connect_timeout",
             Self::UpstreamTimeout => "upstream_timeout",
+            Self::ServiceOverloaded => "service_overloaded",
         }
     }
 
@@ -67,6 +73,7 @@ impl ProxyError {
                 502
             }
             Self::ConnectTimeout | Self::UpstreamTimeout => 504,
+            Self::ServiceOverloaded => 503,
         }
     }
 
@@ -80,6 +87,7 @@ impl ProxyError {
             | Self::UpstreamFailed { message } => message,
             Self::ConnectTimeout => "连接超时",
             Self::UpstreamTimeout => "上游响应超时",
+            Self::ServiceOverloaded => "服务并发已达上限，请稍后重试",
         }
     }
 }

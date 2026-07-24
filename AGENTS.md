@@ -5,7 +5,8 @@
 本仓库是 Rust 2021 edition 的单 crate 项目，最低支持 Rust 1.75。M1 已实现完整 Relay，包含 library target 和 binary target，可通过 `cargo run` 启动代理服务。
 
 - `src/main.rs`：进程入口、配置加载、宿主接口刷新调度与 SIGTERM 优雅关闭。
-- `src/app.rs`：Axum Router 与 Tower 并发上限中间件。
+- `src/app.rs`：Axum Router 组装。
+- `src/concurrency.rs`：进程级并发上限；permit 挂在响应 Body 上，流结束才释放，饱和时返回 503。
 - `src/proxy.rs`：核心代理编排，集成 Connector、重定向状态机与流式 Body 桥接。
 - `src/config.rs`：环境变量解析、校验与 typed Config。
 - `src/headers.rs`：请求/响应 header 清理与 CORS 预检/响应头。
@@ -15,9 +16,11 @@
 - `src/resolver.rs`：DNS 解析、fail-closed 公网地址策略和连接地址固定。
 - `src/connector.rs`：在一次调用中完成 resolve、全量校验、dial 和 TLS 握手。
 - `src/redirect.rs`：重定向状态机、降级拦截与逐跳复查。
-- `tests/`：本地 HTTP/HTTPS fixture、Connector 集成测试、TLS spike 和 M1 端到端 relay 测试。
+- `tests/`：本地 HTTP/HTTPS fixture、Connector 集成测试、TLS spike、M1 端到端 relay 测试和并发/流生命周期回归测试。
 - `Dockerfile`、`docker-compose.yml`：多阶段构建与单容器部署。
-- `DESIGN.md`：安全模型、模块边界、里程碑与测试计划；涉及行为调整前应先核对这里的约束。
+- `DESIGN.md`：**当前**安全模型、模块边界、资源边界与错误契约，含已知偏差清单；涉及行为调整前应先核对这里的约束。它只描述已实现的行为，不写承诺。
+- `docs/adr/0001-any-proxy-relay-design.md`：立项时的设计推演与备选方案，历史快照，不再维护。其中若干 premise 已被实现推翻，不要据此判断当前行为。
+- `TODOS.md`：待办与优先级排序（资源边界 → 安全边界 → 产品真实性 → 部署体验）。
 - `.github/workflows/ci.yml`：合并门槛，以 `fmt + clippy + test` 为准。
 
 新增代码应放入职责最接近的现有模块。只有形成独立安全边界或清晰领域职责时才新增模块，并在 `src/lib.rs` 暴露必要 API。
@@ -36,8 +39,8 @@ cargo run --release
 
 - `cargo build`：编译 library、binary 和依赖，适合完成一组修改后的快速验证。
 - `cargo fmt --check`：检查 Rustfmt 格式，不修改文件；需要修复时运行 `cargo fmt`。
-- `cargo clippy -- -D warnings`：运行静态检查，并将所有 warning 视为错误；与 CI 一致。
-- `cargo test`：运行全部测试（单元测试、集成测试和文档测试），当前共 112 个。
+- `cargo clippy --all-targets -- -D warnings`：运行静态检查。注意 CI 当前未加 `--all-targets`，测试代码的 lint 不会被拦截（见 TODOS 第 7 档）。
+- `cargo test`：运行全部测试，当前共 126 个（另有 1 个默认 ignore 的 35 秒长传输回归，用 `cargo test --test concurrency -- --ignored` 手动跑）。
 - `cargo test <test_name>`：只运行指定测试，适合开发时快速反馈。
 - `cargo test --test integration`：只运行 Connector 集成测试。
 - `cargo test --test tls_spike`：只运行 TLS fixture 测试。
