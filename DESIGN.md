@@ -104,8 +104,7 @@ https://proxy.example.com/https://api.example.com/data?city=shanghai
 
 文档此前笼统称为「fail-closed」，实际是两种不同机制：
 
-- **IPv6：正向白名单（真 fail-closed）** — 只允许 `2000::/3` 全局单播，其余一律拒绝。
-  - ⚠️ 已知缺口：`2000::/3` 内含 6to4（`2002::/16`）、Teredo（`2001::/32`）等转换地址，它们嵌入 IPv4，在宿主有对应路由时构成条件式 SSRF。见 TODOS E8。
+- **IPv6：正向白名单（真 fail-closed）** — 只允许 `2000::/3` 全局单播，其余一律拒绝；`2000::/3` 内嵌入 IPv4 的 6to4（`2002::/16`）、Teredo（`2001::/32`）、ORCHID（`2001:10::/28`）已显式加入 deny 列表。
 - **IPv4：穷举 denylist（fail-open）** — 不在 deny 列表中的地址视为公网。
   - 这是取舍而非疏忽：Rust 的 `Ipv4Addr::is_global()` 仍未稳定。
   - 代价：新分配的 IANA 特殊用途段在补进列表前会被放行。
@@ -118,8 +117,19 @@ deny 列表覆盖：私网、链路本地（含云元数据 `169.254.169.254`）
 
 - 容器无法自动发现 NAT hairpin 对应的宿主公网地址，需通过 `DENY_CIDRS` 补充。
 - 宿主接口地址刷新之间存在最长一个刷新周期的竞态窗口。
-- 允许任意公共端口 1-65535，实例可被用于端口扫描。
-- 公网匿名无额度控制的风险没有技术消除。
+- 默认允许任意公共端口 1-65535，实例可被用于端口扫描（可用 `ALLOW_PORTS` 收紧）。
+- 公网匿名无额度控制的风险没有技术消除（访问面可用下方 C1 安全带收紧，全局流量预算属未做的批次 2）。
+
+### 可选访问控制（C1）
+
+逐跳内网地址防护是**不可退让**的核心不变量；在它之上，C1 提供一层**可选、默认关**的访问控制，只在显式配置时生效，不改变零配置的匿名默认：
+
+- `ALLOW_TARGETS`（目标 host allowlist，支持后缀匹配）、`ALLOW_PORTS`（端口 allowlist）
+- `ALLOW_ORIGINS`（Origin allowlist，命中回显具体 origin 并加 `Vary: Origin`，否则 403）
+- `AUTH_TOKEN`（共享令牌，走 `X-Proxy-Token`，转发前删除）
+- **启动 gate**：非 loopback 监听且未配置任何上述防护、也未设 `PUBLIC_MODE=1` 时拒绝启动，堵住无意识公网暴露。
+
+> **对 ADR Premise 3 的修正**：原 EUREKA「放弃调用方访问控制」只对**依赖调用方身份**的手段（per-user token）成立——纯前端存不住长期密钥。但 `ALLOW_TARGETS` 与全局流量预算**不看调用方是谁**，不受该前提制约，因此纳入 C1。此修正不推翻「匿名默认、additive」的 UC-1 决定，只新增 gate 与不依赖身份的收紧手段。
 
 ## 5. HTTP 接口
 
@@ -174,6 +184,7 @@ deny 列表覆盖：私网、链路本地（含云元数据 `169.254.169.254`）
 | HTTP | code |
 |------|------|
 | 400 | `invalid_target` |
+| 401 | `unauthorized` |
 | 403 | `target_blocked` |
 | 405 | `method_not_allowed` |
 | 502 | `dns_failed` / `connect_failed` / `upstream_failed` |

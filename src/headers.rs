@@ -43,6 +43,7 @@ const REQUEST_STRIP: &[&str] = &[
     "x-real-ip",
     "cookie",
     "x-proxy-request-id",
+    "x-proxy-token",
 ];
 
 /// 响应侧额外移除的 headers

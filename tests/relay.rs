@@ -583,3 +583,129 @@ async fn test_redirect_followed_end_to_end() {
 
     server.shutdown();
 }
+
+/// 用自定义 Config 启动测试代理
+async fn start_proxy_with_config(config: Config) -> (u16, tokio::task::JoinHandle<()>) {
+    let policy = AddressPolicy::allow_all_for_test();
+    let connector = Arc::new(Connector::new(LoopbackResolver, policy, TcpDialer::new()));
+    let app = create_app(connector, Arc::new(config));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (port, handle)
+}
+
+/// 发送带单个自定义 header 的 GET 请求
+async fn http_get_with_header(port: u16, path: &str, hname: &str, hval: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("连接代理应成功");
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\n{hname}: {hval}\r\nConnection: close\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("发送应成功");
+    let mut response = Vec::new();
+    let mut buf = vec![0u8; 8192];
+    loop {
+        match stream.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => panic!("读取失败: {e}"),
+        }
+    }
+    String::from_utf8_lossy(&response).to_string()
+}
+
+/// 测试 16: AUTH_TOKEN 端到端（C1）
+///
+/// 配置后无 token 返回 401 且不触达上游；正确 token 通过，且 X-Proxy-Token 不转发给上游。
+#[tokio::test]
+async fn test_auth_token_required() {
+    let server = fixture::RecordingServer::start(vec![fixture::CannedResponse::ok("done")]).await;
+    let port = server.addr.port();
+    let proxy_path = format!("/http://127.0.0.1:{port}/");
+    let config = Config {
+        auth_token: Some("secret".into()),
+        ..Default::default()
+    };
+    let (proxy_port, _h) = start_proxy_with_config(config).await;
+
+    let resp = http_get(proxy_port, &proxy_path).await;
+    assert!(resp.contains("401"), "无 token 应返回 401: {resp}");
+    assert!(
+        resp.contains("unauthorized"),
+        "错误码应为 unauthorized: {resp}"
+    );
+    assert!(server.recorded().is_empty(), "拒绝时不应触达上游");
+
+    let resp2 = http_get_with_header(proxy_port, &proxy_path, "X-Proxy-Token", "secret").await;
+    assert!(resp2.contains("200"), "正确 token 应通过: {resp2}");
+    let rec = server.recorded();
+    assert_eq!(rec.len(), 1);
+    assert!(
+        rec[0].header("x-proxy-token").is_none(),
+        "X-Proxy-Token 不应转发给上游"
+    );
+
+    server.shutdown();
+}
+
+/// 测试 17: 目标 allowlist 端到端（C1）
+#[tokio::test]
+async fn test_target_allowlist_blocks() {
+    let server = fixture::RecordingServer::start(vec![fixture::CannedResponse::ok("done")]).await;
+    let port = server.addr.port();
+    // 只允许 example.com，实际目标是 127.0.0.1 → 应被拒
+    let config = Config {
+        allow_targets: vec!["example.com".into()],
+        ..Default::default()
+    };
+    let (proxy_port, _h) = start_proxy_with_config(config).await;
+
+    let resp = http_get(proxy_port, &format!("/http://127.0.0.1:{port}/")).await;
+    assert!(resp.contains("403"), "不在 allowlist 应返回 403: {resp}");
+    assert!(server.recorded().is_empty(), "拒绝时不应触达上游");
+
+    server.shutdown();
+}
+
+/// 测试 18: Origin allowlist 端到端（C1）
+///
+/// 不匹配 Origin 返回 403；匹配 Origin 通过并回显该 origin（而非 `*`）。
+#[tokio::test]
+async fn test_origin_allowlist() {
+    let server = fixture::RecordingServer::start(vec![
+        fixture::CannedResponse::ok("a"),
+        fixture::CannedResponse::ok("b"),
+    ])
+    .await;
+    let port = server.addr.port();
+    let proxy_path = format!("/http://127.0.0.1:{port}/");
+    let config = Config {
+        allow_origins: vec!["https://app.example.com".into()],
+        ..Default::default()
+    };
+    let (proxy_port, _h) = start_proxy_with_config(config).await;
+
+    let resp = http_get_with_header(proxy_port, &proxy_path, "Origin", "https://evil.com").await;
+    assert!(resp.contains("403"), "不匹配 Origin 应返回 403: {resp}");
+
+    let resp2 =
+        http_get_with_header(proxy_port, &proxy_path, "Origin", "https://app.example.com").await;
+    assert!(resp2.contains("200"), "匹配 Origin 应通过: {resp2}");
+    assert!(
+        resp2
+            .to_lowercase()
+            .contains("access-control-allow-origin: https://app.example.com"),
+        "应回显具体 origin 而非 *: {resp2}"
+    );
+
+    server.shutdown();
+}

@@ -47,6 +47,10 @@ pub enum ProxyError {
     ///
     /// 饱和时立即拒绝而不是排队：调用方需要知道「过载」而不是看到「卡死」。
     ServiceOverloaded,
+    /// 缺少或无效的代理令牌（HTTP 401）
+    ///
+    /// 配置 `AUTH_TOKEN` 后，请求未带正确 `X-Proxy-Token` 时返回。
+    Unauthorized,
 }
 
 impl ProxyError {
@@ -61,6 +65,7 @@ impl ProxyError {
             Self::ConnectTimeout => "connect_timeout",
             Self::UpstreamTimeout => "upstream_timeout",
             Self::ServiceOverloaded => "service_overloaded",
+            Self::Unauthorized => "unauthorized",
         }
     }
 
@@ -74,6 +79,7 @@ impl ProxyError {
             }
             Self::ConnectTimeout | Self::UpstreamTimeout => 504,
             Self::ServiceOverloaded => 503,
+            Self::Unauthorized => 401,
         }
     }
 
@@ -88,6 +94,7 @@ impl ProxyError {
             Self::ConnectTimeout => "连接超时",
             Self::UpstreamTimeout => "上游响应超时",
             Self::ServiceOverloaded => "服务并发已达上限，请稍后重试",
+            Self::Unauthorized => "缺少或无效的代理令牌",
         }
     }
 }

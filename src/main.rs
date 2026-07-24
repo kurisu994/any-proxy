@@ -45,6 +45,21 @@ async fn main() {
         "启动 any-proxy"
     );
 
+    // 2.5 启动 gate（C1）：非 loopback 监听会把开放代理暴露到网络，
+    //     此时必须至少有一项防护，否则拒绝启动，堵住「无意识公网暴露」。
+    if should_gate_startup(&config) {
+        eprintln!(
+            "拒绝启动：监听 {} 会把开放代理暴露到网络，但未配置任何防护。",
+            config.listen_addr
+        );
+        eprintln!("请至少做以下之一：");
+        eprintln!("  - PUBLIC_MODE=1        显式确认公网匿名开放的风险");
+        eprintln!("  - ALLOW_TARGETS=...    限制可代理的目标 host");
+        eprintln!("  - AUTH_TOKEN=...       要求调用方携带 X-Proxy-Token");
+        eprintln!("  - LISTEN_ADDR=127.0.0.1:8080   改为仅本机监听");
+        std::process::exit(1);
+    }
+
     // 3. 创建 AddressPolicy（spawn_host_refresh 内部会立即刷新一次）
     //    DENY_CIDRS 非法直接终止启动，避免防护静默失效（N12）
     let policy = match AddressPolicy::new().with_env_deny_cidrs() {
@@ -210,4 +225,57 @@ async fn shutdown_signal() {
     }
 
     tracing::info!("收到关闭信号，开始优雅关闭...");
+}
+
+/// 启动 gate 判断（C1）：非 loopback 监听且无任何防护时应拒绝启动
+///
+/// 防护 = `PUBLIC_MODE` 显式开启 / 配置了目标 allowlist / 配置了 AUTH_TOKEN。
+fn should_gate_startup(config: &Config) -> bool {
+    !config.listen_addr.ip().is_loopback()
+        && !config.public_mode
+        && config.allow_targets.is_empty()
+        && config.auth_token.is_none()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(addr: &str) -> Config {
+        Config {
+            listen_addr: addr.parse().unwrap(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_gate_blocks_public_without_guard() {
+        assert!(
+            should_gate_startup(&cfg("0.0.0.0:8080")),
+            "公网监听零防护应拦下"
+        );
+    }
+
+    #[test]
+    fn test_gate_allows_loopback() {
+        assert!(
+            !should_gate_startup(&cfg("127.0.0.1:8080")),
+            "loopback 监听应放行"
+        );
+    }
+
+    #[test]
+    fn test_gate_allows_public_with_any_guard() {
+        let mut public_mode = cfg("0.0.0.0:8080");
+        public_mode.public_mode = true;
+        assert!(!should_gate_startup(&public_mode));
+
+        let mut with_token = cfg("0.0.0.0:8080");
+        with_token.auth_token = Some("x".into());
+        assert!(!should_gate_startup(&with_token));
+
+        let mut with_allowlist = cfg("0.0.0.0:8080");
+        with_allowlist.allow_targets = vec!["x.com".into()];
+        assert!(!should_gate_startup(&with_allowlist));
+    }
 }

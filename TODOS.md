@@ -78,11 +78,12 @@
 
 ## 第 5 档 — 安全默认（在 D3 之前）
 
-- [ ] **C1（P1）安全带** — 增加 `ALLOW_ORIGINS` / `ALLOW_TARGETS` / `AUTH_TOKEN`，默认端口限 `80/443`，显式 `unsafe-open` 才全开。
-  - ⚠️ **需重新拍板**：现措辞是「可选、默认关」，Codex 指出这自相矛盾——标题叫「安全默认」却不改变任何默认值，加了一堆开关后默认姿态仍是不可运营。它建议默认应为**私有监听或必须配置目标 allowlist**，`unsafe-open` 才允许匿名任意目标。这与 2026-07-15 接受 UC-1 时「保留匿名默认、additive」的决定冲突，需要你重新定。
-  - 文件：`src/config.rs`、`src/headers.rs`、`src/target.rs`、`src/proxy.rs`、`README.md` · CC ~2h
-- [ ] **（P2）字节与时长预算** — 请求/响应字节上限、全局每日出口预算、per-client 限速。Codex：「流式传输解决内存，不解决带宽账单」。原 DESIGN 把这些排除在外，但无任何预算意味着带宽耗尽风险没有技术兜底。
-  - 文件：`src/config.rs`、`src/proxy.rs` · CC ~2h
+- [x] **C1（P1）安全带 — 批次 1 完成** — 2026-07-24 拍板：**折中默认姿态（additive + 启动 gate）+ 四类不依赖调用方身份的访问控制**。
+  - 决策（不推翻 UC-1「匿名默认」）：新增启动 gate（非 loopback 监听 + 零防护 → 拒绝启动）；纳入 `ALLOW_TARGETS`/`ALLOW_PORTS`/`ALLOW_ORIGINS`/`AUTH_TOKEN`（走 `X-Proxy-Token`，转发前删除）；修正 Premise 3（区分「调用方身份鉴权」与「目标/预算控制」）。
+  - 实现：`config.rs`（字段+解析+`target_allowed`/`port_allowed`/`origin_allowed`）、`lib.rs`（`401 unauthorized`）、`main.rs`（`should_gate_startup`+单测）、`proxy.rs`（校验+Origin 回显）、`headers.rs`（strip `X-Proxy-Token`）。测试：config 单测 + relay 端到端 3 组（auth/target/origin）。文档：README/DESIGN 同步。
+  - ⏳ **批次 2** = 下面的「字节与时长预算」，单独排。
+- [ ] **C1 批次 2（P2）字节与时长预算** — 请求/响应字节上限、全局每日出口预算、per-client 限速。Codex：「流式传输解决内存，不解决带宽账单」。原 DESIGN 把这些排除在外，但无任何预算意味着带宽耗尽风险没有技术兜底。已在拍板中同意纳入，本轮只交付批次 1。
+  - 文件：`src/config.rs`、`src/proxy.rs`（可新增 `budget.rs`）· CC ~2h
 - [ ] **C4（P2）abuse kill-switch** — 进程级滥用熔断开关 + 运营手段。
   - ⚠️ Codex 指出原 ~1h 估算不可信：它同时覆盖 kill-switch、带宽预算和部署体验，且未定义预算维度、触发行为与恢复流程。需要先拆解。
   - 文件：`.github/workflows/`、`src/telemetry.rs`、`src/config.rs` · CC 待重估
@@ -129,6 +130,6 @@
 
 ## 未决项（需你拍板）
 
-- [ ] **C1 默认姿态** — 见第 5 档。「可选默认关」vs「默认私有/必须配 allowlist，`unsafe-open` 才全开」。后者推翻 2026-07-15 接受 UC-1 时的决定。
-- [ ] **产品定位** — Codex 直言：「先决定是自用工具还是产品」。当前形态下它预估未来 6 个月活跃部署者 `1-5`、尝试构建 `10-50`。若定位为产品，第一里程碑不该是 M2 供应链，而应是「10 个目标用户中至少 5 个能在 10 分钟内安全部署，两周后仍在用」。
-- [ ] **访问控制的「错误二分」** — DESIGN 的核心 EUREKA 是「前端存不住长期密钥 → 放弃调用方访问控制」。Codex 认为这是错误二分：目标 allowlist、短期签名、同源后端换票、全局预算、可轮换 token 都仍然有效。若成立，动摇 Premise 3 与整个 C1 设计。
+- [x] **C1 默认姿态** — 2026-07-24 定：**折中方案**（保留匿名默认、additive，新增启动 gate），不推翻 UC-1。见第 5 档 C1。
+- [x] **访问控制的「错误二分」** — 2026-07-24 定：部分采纳 Codex。**目标 allowlist / 全局预算不依赖调用方身份**，不受「前端存不住密钥」制约，已纳入 C1；per-user 身份鉴权仍放弃。DESIGN §4 已记修正。
+- [ ] **产品定位** — 仍开放。Codex：「先决定是自用工具还是产品」，预估 6 个月活跃部署 `1-5`、尝试 `10-50`。决策倾向偏「自用/实验」（故 C1 走折中而非默认收紧）。若正式定位为产品，第一里程碑应是「10 个目标用户至少 5 个能 10 分钟内安全部署、两周后仍在用」，而非 M2 供应链。

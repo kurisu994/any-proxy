@@ -105,8 +105,8 @@ any-proxy 的安全边界完全在**目标地址校验**：
 
 - 容器无法自动发现 NAT hairpin 对应的宿主公网地址，需通过 `DENY_CIDRS` 补充
 - 宿主接口地址每 60 秒刷新，网络配置变化后最多 60 秒竞态窗口
-- 允许任意公共端口 1-65535，实例可被用于端口扫描
-- 公网匿名无额度控制的风险没有技术消除
+- 默认允许任意公共端口 1-65535，实例可被用于端口扫描（可用 `ALLOW_PORTS` 收紧到 `80,443`）
+- 公网匿名无额度控制的风险没有技术消除（`ALLOW_TARGETS` / `AUTH_TOKEN` 可收紧访问面，但全局流量预算属批次 2 未做）
 - 新分配的 IANA IPv4 特殊用途段在补进 deny 列表前会被放行
 
 > 完整的已知偏差清单见 [DESIGN.md 第 10 节](DESIGN.md#10-已知偏差汇总)。
@@ -121,6 +121,11 @@ any-proxy 的安全边界完全在**目标地址校验**：
 | `DENY_CIDRS` | (空) | 额外拒绝的 CIDR 列表，逗号分隔 |
 | `MAX_CONCURRENT_REQUESTS` | 256 | 进程级并发上限，达到上限立即返回 `503 service_overloaded` |
 | `MAX_URI_BYTES` | 16384 | URI 最大字节数 |
+| `ALLOW_TARGETS` | (空) | 目标 host allowlist，逗号分隔；空=不限，支持后缀 `.x.com` 匹配子域 |
+| `ALLOW_ORIGINS` | (空) | Origin allowlist，逗号分隔；空=回显 `*`，命中回显具体 origin，否则 403 |
+| `AUTH_TOKEN` | (空) | 共享代理令牌；配置后请求需带 `X-Proxy-Token`，否则 401 |
+| `ALLOW_PORTS` | (空) | 目标端口 allowlist，逗号分隔；空=不限（1-65535） |
+| `PUBLIC_MODE` | false | 显式确认公网匿名开放；非 loopback 监听且无其它防护时必须开启才允许启动 |
 | `DNS_TIMEOUT` | 5s | DNS 解析超时 |
 | `CONNECT_TIMEOUT` | 10s | TCP 连接超时 |
 | `TLS_TIMEOUT` | 10s | TLS 握手超时 |
@@ -130,6 +135,25 @@ any-proxy 的安全边界完全在**目标地址校验**：
 | `SHUTDOWN_GRACE` | 30s | 优雅关闭等待时间 |
 | `HOST_REFRESH_INTERVAL` | 60s | 宿主接口地址刷新间隔 |
 | `RUST_LOG` | info | 日志级别 |
+
+### 安全带（可选，默认全关）
+
+以上 `ALLOW_TARGETS` / `ALLOW_ORIGINS` / `AUTH_TOKEN` / `ALLOW_PORTS` 都是**可选、默认关**的访问控制，只在显式配置时生效，不改变零配置的匿名默认行为。它们是 additive 的，可任意组合。
+
+**启动 gate**：唯一改变默认体验的是——当监听地址**不是 loopback**（如默认的 `0.0.0.0`）**且**未配置任何 `ALLOW_TARGETS` / `AUTH_TOKEN`、也未设 `PUBLIC_MODE=1` 时，进程**拒绝启动**。这是为了堵住「无意识地把开放代理推上公网」。解决办法四选一：
+
+```bash
+# 1) 显式确认公网匿名开放的风险
+PUBLIC_MODE=1 ./any-proxy
+# 2) 限制可代理的目标
+ALLOW_TARGETS=api.github.com,.example.com ./any-proxy
+# 3) 要求调用方令牌
+AUTH_TOKEN=your-secret ./any-proxy   # 请求需带 X-Proxy-Token: your-secret
+# 4) 仅本机监听（不触发 gate）
+LISTEN_ADDR=127.0.0.1:8080 ./any-proxy
+```
+
+> 说明：`ALLOW_TARGETS` 与 `ALLOW_PORTS` 不依赖调用方身份，是最有效的收紧手段；`X-Proxy-Token` 在转发前会被删除，不会泄漏给上游；纯前端场景令牌对终端用户可见，价值有限。
 
 ## HTTP 接口
 
@@ -148,7 +172,8 @@ any-proxy 的安全边界完全在**目标地址校验**：
 | code | HTTP | 常见原因 | 排查动作 |
 |------|------|----------|----------|
 | `invalid_target` | 400 | URL 非法、带 userinfo、端口越界、URI 超长 | 检查代理前缀后的目标 URL 格式 |
-| `target_blocked` | 403 | 目标解析到私网/保留/宿主地址，或 HTTPS 降级 | 确认目标是公网地址；是否命中 `DENY_CIDRS` |
+| `unauthorized` | 401 | 配置 `AUTH_TOKEN` 后缺少/错误的 `X-Proxy-Token` | 请求带上正确的 `X-Proxy-Token` header |
+| `target_blocked` | 403 | 目标非公网/降级，或不在 `ALLOW_TARGETS`/`ALLOW_PORTS`/`ALLOW_ORIGINS` | 确认目标合规；检查 allowlist 配置 |
 | `method_not_allowed` | 405 | 使用了 CONNECT/TRACE 等不支持的方法 | 仅用 GET/HEAD/POST/PUT/PATCH/DELETE/OPTIONS |
 | `dns_failed` | 502 | 域名无法解析或返回空答案 | 确认域名可解析；检查代理所在网络 DNS |
 | `connect_failed` | 502 | 所有候选地址 TCP/TLS 均失败 | 目标端口是否开放；TLS 证书是否可信 |

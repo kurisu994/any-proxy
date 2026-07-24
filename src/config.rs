@@ -18,6 +18,16 @@ pub struct Config {
     pub max_concurrent_requests: usize,
     /// URI 字节上限（进入目标解析前检查）
     pub max_uri_bytes: usize,
+    /// 目标 host allowlist（空=不限）；支持精确 `api.x.com` 与后缀 `.x.com`
+    pub allow_targets: Vec<String>,
+    /// Origin allowlist（空=`*`）；命中回显该 origin，否则拒绝
+    pub allow_origins: Vec<String>,
+    /// 共享代理令牌（None=不要求）；走 `X-Proxy-Token` header
+    pub auth_token: Option<String>,
+    /// 目标端口 allowlist（空=不限，1-65535）
+    pub allow_ports: Vec<u16>,
+    /// 公网监听确认开关：非 loopback 监听且无任何防护时需显式开启
+    pub public_mode: bool,
     /// DNS 解析超时
     pub dns_timeout: Duration,
     /// TCP 连接超时
@@ -42,6 +52,11 @@ impl Default for Config {
             listen_addr: "0.0.0.0:8080".parse().unwrap(),
             max_concurrent_requests: 256,
             max_uri_bytes: 16384,
+            allow_targets: Vec::new(),
+            allow_origins: Vec::new(),
+            auth_token: None,
+            allow_ports: Vec::new(),
+            public_mode: false,
             dns_timeout: Duration::from_secs(5),
             connect_timeout: Duration::from_secs(10),
             tls_timeout: Duration::from_secs(10),
@@ -91,6 +106,13 @@ impl Config {
 
         config.max_uri_bytes = env_usize("MAX_URI_BYTES", config.max_uri_bytes, 256, 1_048_576)?;
 
+        // C1 安全带：以下全部默认关（空/false），仅在显式配置时生效
+        config.allow_targets = env_list("ALLOW_TARGETS");
+        config.allow_origins = env_list("ALLOW_ORIGINS");
+        config.auth_token = env_str("AUTH_TOKEN");
+        config.allow_ports = env_ports("ALLOW_PORTS")?;
+        config.public_mode = env_bool("PUBLIC_MODE");
+
         config.dns_timeout = env_duration("DNS_TIMEOUT", config.dns_timeout, 1, 300)?;
         config.connect_timeout = env_duration("CONNECT_TIMEOUT", config.connect_timeout, 1, 300)?;
         config.tls_timeout = env_duration("TLS_TIMEOUT", config.tls_timeout, 1, 300)?;
@@ -120,6 +142,36 @@ impl Config {
     }
 }
 
+impl Config {
+    /// 目标 host 是否被 allowlist 允许（空列表=不限）
+    ///
+    /// 支持精确匹配 `api.x.com` 与后缀匹配 `.x.com`（匹配任意子域）。
+    pub fn target_allowed(&self, host: &str) -> bool {
+        if self.allow_targets.is_empty() {
+            return true;
+        }
+        let host = host.to_lowercase();
+        self.allow_targets.iter().any(|entry| {
+            if let Some(suffix) = entry.strip_prefix('.') {
+                // `.x.com` 匹配 `a.x.com`，也匹配裸 `x.com`
+                host == suffix || host.ends_with(entry)
+            } else {
+                host == *entry
+            }
+        })
+    }
+
+    /// 目标端口是否被 allowlist 允许（空列表=不限）
+    pub fn port_allowed(&self, port: u16) -> bool {
+        self.allow_ports.is_empty() || self.allow_ports.contains(&port)
+    }
+
+    /// Origin 是否被 allowlist 允许（空列表=允许所有）
+    pub fn origin_allowed(&self, origin: &str) -> bool {
+        self.allow_origins.is_empty() || self.allow_origins.contains(&origin.to_lowercase())
+    }
+}
+
 impl ConfigError {
     fn new(env: &str, message: String) -> Self {
         Self {
@@ -132,6 +184,50 @@ impl ConfigError {
 /// 读取环境变量字符串
 fn env_str(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|s| !s.is_empty())
+}
+
+/// 读取逗号分隔列表，去空白、转小写、丢弃空项（用于 host / origin allowlist）
+fn env_list(key: &str) -> Vec<String> {
+    match env_str(key) {
+        Some(s) => s
+            .split(',')
+            .map(|t| t.trim().to_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+/// 读取逗号分隔端口列表，非法端口返回错误（fail-closed）
+fn env_ports(key: &str) -> Result<Vec<u16>, ConfigError> {
+    match env_str(key) {
+        Some(s) => {
+            let mut ports = Vec::new();
+            for tok in s.split(',') {
+                let t = tok.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                let p: u16 = t
+                    .parse()
+                    .map_err(|e| ConfigError::new(key, format!("无效端口 `{t}`: {e}")))?;
+                if p == 0 {
+                    return Err(ConfigError::new(key, "端口不能为 0".into()));
+                }
+                ports.push(p);
+            }
+            Ok(ports)
+        }
+        None => Ok(Vec::new()),
+    }
+}
+
+/// 读取布尔环境变量（`1`/`true`/`yes`/`on` 视为真，大小写不敏感）
+fn env_bool(key: &str) -> bool {
+    match env_str(key) {
+        Some(s) => matches!(s.to_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+        None => false,
+    }
 }
 
 /// 解析 usize 环境变量，带上下界校验
@@ -280,5 +376,65 @@ mod tests {
         std::env::remove_var("CONNECT_TIMEOUT");
         assert_eq!(config.max_concurrent_requests, 512);
         assert_eq!(config.connect_timeout, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn test_target_allowed() {
+        let mut c = Config::default();
+        assert!(c.target_allowed("anything.com"), "空列表应不限");
+        c.allow_targets = vec!["api.example.com".into(), ".trusted.com".into()];
+        assert!(c.target_allowed("api.example.com"), "精确匹配");
+        assert!(!c.target_allowed("evil.com"));
+        assert!(c.target_allowed("a.trusted.com"), "后缀匹配子域");
+        assert!(c.target_allowed("trusted.com"), "后缀匹配裸域");
+        assert!(!c.target_allowed("nottrusted.com"), "不应误匹配");
+        assert!(c.target_allowed("API.EXAMPLE.COM"), "大小写不敏感");
+    }
+
+    #[test]
+    fn test_port_allowed() {
+        let mut c = Config::default();
+        assert!(c.port_allowed(12345), "空列表应不限");
+        c.allow_ports = vec![80, 443];
+        assert!(c.port_allowed(443));
+        assert!(!c.port_allowed(8080));
+    }
+
+    #[test]
+    fn test_origin_allowed() {
+        let mut c = Config::default();
+        assert!(c.origin_allowed("https://any.com"), "空列表应允许");
+        c.allow_origins = vec!["https://app.example.com".into()];
+        assert!(c.origin_allowed("https://app.example.com"));
+        assert!(!c.origin_allowed("https://evil.com"));
+    }
+
+    #[test]
+    fn test_env_ports_invalid_fails() {
+        let _lock = env_lock();
+        std::env::set_var("ALLOW_PORTS", "80,not-a-port");
+        let result = Config::from_env();
+        std::env::remove_var("ALLOW_PORTS");
+        assert!(result.is_err(), "非法端口应 fail-closed");
+    }
+
+    #[test]
+    fn test_env_c1_defaults_empty() {
+        let _lock = env_lock();
+        for k in [
+            "ALLOW_TARGETS",
+            "ALLOW_ORIGINS",
+            "AUTH_TOKEN",
+            "ALLOW_PORTS",
+            "PUBLIC_MODE",
+        ] {
+            std::env::remove_var(k);
+        }
+        let c = Config::from_env().unwrap();
+        assert!(c.allow_targets.is_empty());
+        assert!(c.allow_origins.is_empty());
+        assert!(c.auth_token.is_none());
+        assert!(c.allow_ports.is_empty());
+        assert!(!c.public_mode, "默认零配置：所有安全带关闭，向后兼容");
     }
 }

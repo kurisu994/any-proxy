@@ -96,6 +96,56 @@ where
         return error::build_index_response();
     }
 
+    // C1 访问控制：healthz / index 已豁免，以下对所有代理类请求（含预检）生效
+
+    // AUTH_TOKEN 校验：配置后要求携带正确的 X-Proxy-Token
+    if let Some(expected) = &state.config.auth_token {
+        let provided = req_headers
+            .get("x-proxy-token")
+            .and_then(|v| v.to_str().ok());
+        if provided != Some(expected.as_str()) {
+            let resp = error::build_error_response(&crate::ProxyError::Unauthorized, &request_id);
+            log_complete(
+                &request_id,
+                &method,
+                &resp,
+                start,
+                Some("unauthorized"),
+                None,
+            );
+            return resp;
+        }
+    }
+
+    // Origin allowlist 校验，并计算成功响应要回显的 origin（未配置时用默认 `*`）
+    let cors_origin: Option<String> = if state.config.allow_origins.is_empty() {
+        None
+    } else {
+        match req_headers.get("origin").and_then(|v| v.to_str().ok()) {
+            Some(o) if state.config.origin_allowed(o) => Some(o.to_string()),
+            Some(_) => {
+                // Origin 存在但不匹配：拒绝。message 不回显具体 origin。
+                let resp = error::build_error_response(
+                    &crate::ProxyError::TargetBlocked {
+                        message: "Origin 不被允许".into(),
+                    },
+                    &request_id,
+                );
+                log_complete(
+                    &request_id,
+                    &method,
+                    &resp,
+                    start,
+                    Some("target_blocked"),
+                    None,
+                );
+                return resp;
+            }
+            // 无 Origin（非浏览器请求）：CORS 层不强制，用默认 `*`
+            None => None,
+        }
+    };
+
     // 方法校验
     let proxy_method = match method.as_str() {
         "GET" => ProxyMethod::Get,
@@ -114,7 +164,7 @@ where
 
     // OPTIONS 预检
     if proxy_method == ProxyMethod::Options {
-        let resp = error::build_preflight_response_with_id(
+        let mut resp = error::build_preflight_response_with_id(
             req_headers
                 .get("access-control-request-method")
                 .and_then(|v| v.to_str().ok()),
@@ -123,6 +173,7 @@ where
                 .and_then(|v| v.to_str().ok()),
             &request_id,
         );
+        apply_cors_origin(&mut resp, &cors_origin);
         log_complete(&request_id, &method, &resp, start, None, None);
         return resp;
     }
@@ -136,6 +187,29 @@ where
             return resp;
         }
     };
+
+    // C1 目标 host / 端口 allowlist（未配置时不限）
+    if !state.config.target_allowed(&target.host.as_str())
+        || !state.config.port_allowed(target.port)
+    {
+        // 被拒目标只进内部日志，对外 message 不回显具体 host/port
+        tracing::debug!(host = %target.host, port = target.port, "目标不在 allowlist");
+        let resp = error::build_error_response(
+            &crate::ProxyError::TargetBlocked {
+                message: "目标不在允许列表".into(),
+            },
+            &request_id,
+        );
+        log_complete(
+            &request_id,
+            &method,
+            &resp,
+            start,
+            Some("target_blocked"),
+            Some(&target),
+        );
+        return resp;
+    }
 
     // 对上传 body 应用 idle timeout
     let body = body_timeout::wrap_request_body(
@@ -157,7 +231,8 @@ where
     .await;
 
     match result {
-        Ok(resp) => {
+        Ok(mut resp) => {
+            apply_cors_origin(&mut resp, &cors_origin);
             let error_code = if resp.status().is_server_error() {
                 Some("upstream_error")
             } else {
@@ -342,6 +417,18 @@ fn build_proxy_response(
         body_timeout::wrap_response_body(body, config.upstream_body_idle_timeout, request_id);
 
     Ok(Response::from_parts(parts, axum_body))
+}
+
+/// 配置了 Origin allowlist 时，把响应的 `Access-Control-Allow-Origin` 从默认 `*`
+/// 覆盖为回显的具体 origin，并追加 `Vary: Origin`（C1）。`None` 时保持默认。
+fn apply_cors_origin(resp: &mut Response, origin: &Option<String>) {
+    if let Some(o) = origin {
+        if let Ok(v) = http::HeaderValue::from_str(o) {
+            resp.headers_mut().insert("access-control-allow-origin", v);
+            resp.headers_mut()
+                .append("vary", http::HeaderValue::from_static("Origin"));
+        }
+    }
 }
 
 /// 记录请求完成日志（隐私过滤）
