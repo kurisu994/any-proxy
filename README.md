@@ -65,7 +65,8 @@ curl http://localhost:8080/healthz
 any-proxy 的安全边界完全在**目标地址校验**：
 
 - 拒绝本机、私网、链路本地、保留地址和云元数据地址
-- 地址策略采用 fail-closed：IPv6 仅允许 `2000::/3`（全局单播），IPv4 穷举特殊用途 deny 列表
+- IPv6 采用正向白名单（真 fail-closed）：仅允许 `2000::/3` 全局单播，其余一律拒绝
+- IPv4 采用穷举 denylist：不在 deny 列表中的地址视为公网（因 `Ipv4Addr::is_global()` 尚未稳定，这是取舍）
 - DNS 解析与实际 TCP 连接在同一个 Connector 内原子绑定，防止 DNS rebinding
 - HTTPS 目标在 TCP 连接建立后进行 TLS 握手，SNI 和证书校验使用原始规范化主机名
 - 重定向后逐跳重新验证目标地址
@@ -78,6 +79,10 @@ any-proxy 的安全边界完全在**目标地址校验**：
 - 宿主接口地址每 60 秒刷新，网络配置变化后最多 60 秒竞态窗口
 - 允许任意公共端口 1-65535，实例可被用于端口扫描
 - 公网匿名无额度控制的风险没有技术消除
+- `2000::/3` 内含 6to4、Teredo 等嵌入 IPv4 的转换地址，宿主有对应路由时构成条件式 SSRF（[TODOS](TODOS.md) E8）
+- 新分配的 IANA IPv4 特殊用途段在补进 deny 列表前会被放行
+
+> 完整的已知偏差清单见 [DESIGN.md 第 10 节](DESIGN.md#10-已知偏差汇总)。
 
 ## 配置
 
@@ -87,7 +92,7 @@ any-proxy 的安全边界完全在**目标地址校验**：
 |------|--------|------|
 | `LISTEN_ADDR` | `0.0.0.0:8080` | 监听地址 |
 | `DENY_CIDRS` | (空) | 额外拒绝的 CIDR 列表，逗号分隔 |
-| `MAX_CONCURRENT_REQUESTS` | 256 | 进程级并发上限 |
+| `MAX_CONCURRENT_REQUESTS` | 256 | 进程级并发上限，达到上限立即返回 `503 service_overloaded` |
 | `MAX_HTTP1_BUFFER_BYTES` | 65536 | HTTP/1 parser buffer 上限 |
 | `MAX_HEADERS_COUNT` | 100 | HTTP/1 header 数量上限 |
 | `MAX_URI_BYTES` | 16384 | URI 最大字节数 |
@@ -97,7 +102,6 @@ any-proxy 的安全边界完全在**目标地址校验**：
 | `UPSTREAM_HEADERS_TIMEOUT` | 30s | 等待上游响应 headers 超时 |
 | `UPLOAD_IDLE_TIMEOUT` | 30s | 上传空闲超时 |
 | `UPSTREAM_BODY_IDLE_TIMEOUT` | 60s | 下载空闲超时 |
-| `POOL_IDLE_TIMEOUT` | 30s | 连接池空闲超时 |
 | `SHUTDOWN_GRACE` | 30s | 优雅关闭等待时间 |
 | `HOST_REFRESH_INTERVAL` | 60s | 宿主接口地址刷新间隔 |
 | `RUST_LOG` | info | 日志级别 |
@@ -108,9 +112,18 @@ any-proxy 的安全边界完全在**目标地址校验**：
 |------|------|------|
 | `/<absolute-http-or-https-url>` | GET/HEAD/POST/PUT/PATCH/DELETE | 核心代理入口 |
 | `/<absolute-http-or-https-url>` | OPTIONS | CORS 预检（固定 204） |
-| `/healthz` | GET | 进程存活检查 |
+| `/healthz` | GET | 进程存活检查（不占用并发配额） |
 | `/` | GET | 用法说明与风险提示 |
 | (任意) | CONNECT/TRACE | 405 拒绝 |
+
+### 并发与超时语义
+
+- **没有总请求时长上限。** 只要数据在流动，多长的传输都不会被代理主动中断。
+- 卡死由**逐 frame 空闲超时**兜底：上传看 `UPLOAD_IDLE_TIMEOUT`，下载看 `UPSTREAM_BODY_IDLE_TIMEOUT`。
+- **并发配额覆盖整个响应流的生命周期**，不是只到响应头发出为止。因此 `MAX_CONCURRENT_REQUESTS`
+  限制的是「同时活跃的传输数」，这也是进程 socket 与上游连接任务的真实上界。
+- 达到上限时**立即返回 `503 service_overloaded`**，不排队。调用方应当看到「过载」而不是「卡死」。
+- 上游连接不复用：每次请求都走完整的 resolve → 全量校验 → 固定 IP → dial。
 
 ### CORS 行为
 
@@ -130,7 +143,9 @@ any-proxy 的安全边界完全在**目标地址校验**：
 - 删除固定 hop-by-hop 集合：`Connection`、`Keep-Alive`、`Proxy-*`、`TE`、`Trailer`、`Transfer-Encoding`、`Upgrade`
 - 请求侧额外移除 `Host`、`Forwarded`、`Via`、`X-Forwarded-*`、`Cookie`
 - 响应侧额外移除 `Set-Cookie`、上游 CORS headers、`Server`、`X-Powered-By`
-- 不转发 request/response trailers
+
+> ⚠️ 当前实现有两处偏差：`Proxy-Connection` 等前缀未被通配清理；**trailer frame 会绕过上述全部清理**
+> 并原样透传（[TODOS](TODOS.md) M2）。修复前不要依赖 trailer 侧的清理保证。
 
 ## 开发
 
@@ -144,7 +159,7 @@ any-proxy 的安全边界完全在**目标地址校验**：
 ```bash
 cargo build
 cargo fmt --check
-cargo clippy -- -D warnings
+cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
@@ -159,10 +174,12 @@ LISTEN_ADDR=127.0.0.1:9090 cargo run --release
 ### 测试
 
 ```bash
-cargo test                          # 全部测试（112 个）
+cargo test                          # 全部测试（126 个）
 cargo test --test relay             # M1 端到端集成测试
 cargo test --test integration       # Connector 集成测试
 cargo test --test tls_spike         # TLS spike 测试
+cargo test --test concurrency       # 并发上限与流生命周期回归
+cargo test --test concurrency -- --ignored   # 35 秒长传输回归，默认跳过
 ```
 
 ## 里程碑
@@ -170,12 +187,16 @@ cargo test --test tls_spike         # TLS spike 测试
 | 里程碑 | 状态 | 说明 |
 |--------|------|------|
 | M0 | ✅ 完成 | 安全连接器 spike（URL 解析、地址策略、Connector、重定向） |
-| M1 | ✅ 完成 | 完整 Relay（Axum 接入、CORS、流式转发、Docker、优雅关闭） |
+| M1 | ✅ 完成 | 完整 Relay（Axum 接入、CORS、流式转发、Docker、优雅关闭）。存在已知偏差，见 [DESIGN.md 第 10 节](DESIGN.md#10-已知偏差汇总) |
 | M2 | 待做 | 发布供应链（多架构镜像、SBOM、provenance、Prometheus） |
 
 ## 设计文档
 
-完整设计文档见 [DESIGN.md](DESIGN.md)，包含问题陈述、约束、安全模型、模块边界、测试计划和残余风险。
+当前设计见 [DESIGN.md](DESIGN.md)：安全模型、模块边界、流式与资源边界、错误契约，以及一份**已知偏差清单**。
+
+立项时的设计推演与备选方案已归档为 [docs/adr/0001-any-proxy-relay-design.md](docs/adr/0001-any-proxy-relay-design.md)（历史快照，不再维护）。
+
+待办与优先级见 [TODOS.md](TODOS.md)。
 
 ## 许可证
 
