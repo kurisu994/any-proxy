@@ -489,3 +489,97 @@ async fn test_response_body_idle_timeout() {
 
     server.shutdown();
 }
+
+/// 发送带 body 的自定义方法请求
+async fn http_request_with_body(port: u16, method: &str, path: &str, body: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("连接代理应成功");
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: text/plain\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("发送应成功");
+
+    let mut response = Vec::new();
+    let mut buf = vec![0u8; 8192];
+    loop {
+        match stream.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => panic!("读取失败: {e}"),
+        }
+    }
+    String::from_utf8_lossy(&response).to_string()
+}
+
+/// 测试 14: POST/PUT/PATCH/DELETE 带 body 端到端转发（N10）
+///
+/// 用录制式假上游断言「代理实际发给上游的是什么」：method、path、body 均正确转发，
+/// 且 Host 按目标重建。这是 M1 标准 2 长期缺失的覆盖（原本只测了 GET/HEAD）。
+#[tokio::test]
+async fn test_methods_with_body_forwarded() {
+    for method in ["POST", "PUT", "PATCH", "DELETE"] {
+        let server =
+            fixture::RecordingServer::start(vec![fixture::CannedResponse::ok("done")]).await;
+        let port = server.addr.port();
+        let proxy_path = format!("/http://127.0.0.1:{port}/api/items");
+        let (proxy_port, _handle) = start_proxy().await;
+
+        let body = format!("payload-{method}");
+        let resp = http_request_with_body(proxy_port, method, &proxy_path, &body).await;
+        assert!(resp.contains("200"), "{method} 应返回 200: {resp}");
+        assert!(resp.contains("done"), "{method} 应返回上游 body: {resp}");
+
+        let recorded = server.recorded();
+        assert_eq!(recorded.len(), 1, "{method} 应录到 1 个上游请求");
+        let r = &recorded[0];
+        assert_eq!(r.method, method, "上游收到的 method 应为 {method}");
+        assert_eq!(r.path, "/api/items", "上游收到的 path 应正确");
+        assert_eq!(r.body, body.as_bytes(), "上游收到的 body 应与发送一致");
+        assert_eq!(
+            r.header("host"),
+            Some(format!("127.0.0.1:{port}").as_str()),
+            "Host 应按目标重建"
+        );
+
+        server.shutdown();
+    }
+}
+
+/// 测试 15: 重定向跟随端到端（N10 + N2 相对 Location 解析）
+///
+/// 上游第一跳返回 302 + 相对 `Location: /final`，第二跳返回 200。
+/// 断言代理确实发起了两次请求，且相对 Location 被解析到同 host 的 `/final`。
+/// 这是全仓库首个真正产生 3xx 的端到端重定向测试。
+#[tokio::test]
+async fn test_redirect_followed_end_to_end() {
+    let server = fixture::RecordingServer::start(vec![
+        fixture::CannedResponse::redirect(302, "/final"),
+        fixture::CannedResponse::ok("arrived"),
+    ])
+    .await;
+    let port = server.addr.port();
+    let proxy_path = format!("/http://127.0.0.1:{port}/start");
+    let (proxy_port, _handle) = start_proxy().await;
+
+    let resp = http_get(proxy_port, &proxy_path).await;
+    assert!(resp.contains("200"), "跟随重定向后应返回 200: {resp}");
+    assert!(resp.contains("arrived"), "应返回最终 body: {resp}");
+
+    let recorded = server.recorded();
+    assert_eq!(recorded.len(), 2, "应录到 2 个请求（原始 + 重定向后）");
+    assert_eq!(recorded[0].path, "/start", "首个请求 path 应为 /start");
+    assert_eq!(
+        recorded[1].path, "/final",
+        "相对 Location 应解析到同 host 的 /final（N2）"
+    );
+
+    server.shutdown();
+}

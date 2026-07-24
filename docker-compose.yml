@@ -16,3 +16,11 @@ services:
       start_period: 3s
       retries: 3
     restart: unless-stopped
+    # 容器加固（N11）：无额度开放代理，资源与权限上限是唯一兜底
+    read_only: true # 只写 stdout/stderr，不依赖可写文件系统
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    mem_limit: 256m
+    pids_limit: 256

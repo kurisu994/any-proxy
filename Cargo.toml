@@ -2,7 +2,7 @@
 name = "any-proxy"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.86"
 description = "Rust 公网匿名 CORS Relay — URL 前缀式 HTTP(S) 代理"
 license = "MIT"
 repository = "https://github.com/kurisu994/any-proxy"
@@ -39,16 +39,14 @@ bytes = "1"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "original-uri"] }
 # 出站 HTTP/1.1 客户端
 hyper = { version = "1", features = ["client", "http1"] }
-hyper-util = { version = "0.1", features = ["client", "client-legacy", "tokio"] }
+# 仅用 rt::TokioIo 桥接 tokio stream，无需 client/client-legacy
+hyper-util = { version = "0.1", features = ["tokio"] }
 # TLS
-hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "logging"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-native-certs = "0.7"
-rustls-pemfile = "2"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 # Body 桥接
 http-body-util = "0.1"
-futures-util = { version = "0.3", default-features = false }
 
 [dev-dependencies]
 # 测试用
