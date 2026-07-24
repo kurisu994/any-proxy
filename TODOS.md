@@ -2,7 +2,7 @@
 
 来源：2026-07-15 `/autoplan` 三相评审 + 2026-07-24 `/autoplan` 全量审查（Claude 实测探针 + Codex 交叉验证，10 条结论 8 证实 2 部分成立 0 推翻）。
 
-已完成不列：~~E1 同源重定向误判为环~~、~~D1 容器健康检查失效~~（`904beb9`）、~~M1 并发上限不覆盖响应流~~、~~N1 POOL_IDLE_TIMEOUT 静默截断长传输~~、~~N8 饱和无限挂起~~（本批）。
+已完成不列：~~E1 同源重定向误判为环~~、~~D1 容器健康检查失效~~（`904beb9`）、~~M1 并发上限不覆盖响应流~~、~~N1 POOL_IDLE_TIMEOUT 静默截断长传输~~、~~N8 饱和无限挂起~~、~~M2 trailer 旁路~~、~~M3 debug 日志泄露 query~~、~~N2 Location 解析~~、~~N3 304 误跟随~~、~~N4 IPv6 authority~~（本批）。
 
 排序原则（2026-07-24 定）：**资源边界 → 安全边界 → 产品真实性 → 部署体验**。
 理由：代理转发得对不对是安全运营的前置条件；而降低公网暴露门槛（D3）必须排在安全默认之后，否则是让更多人更容易把不可运营的默认值推上公网。
@@ -21,9 +21,9 @@
 
 ## 第 2 档 — 安全边界（先做）
 
-- [ ] **M2（P1）trailer 绕过 header 清理** — `body_timeout.rs:82` 原样透传所有 frame，trailer frame **从不经过** `clean_request_headers` / `clean_response_headers`。`Set-Cookie`、`Cookie`、转发头、CORS headers 都能藏在 trailer 里穿透代理。这是清理策略旁路，不只是文档不符。
+- [x] **M2（P1）trailer 绕过 header 清理** — `body_timeout.rs:82` 原样透传所有 frame，trailer frame **从不经过** `clean_request_headers` / `clean_response_headers`。`Set-Cookie`、`Cookie`、转发头、CORS headers 都能藏在 trailer 里穿透代理。这是清理策略旁路，不只是文档不符。
   - 文件：`src/body_timeout.rs`、`src/headers.rs` · CC ~20min
-- [ ] **M3（P1）debug 日志泄露完整 query** — `proxy.rs:211`、`proxy.rs:286` 记录 `full_url()`，含 query。`RUST_LOG=debug` 下 API key、签名 URL 全进日志，违反 DESIGN §9。
+- [x] **M3（P1）debug 日志泄露完整 query** — `proxy.rs:211`、`proxy.rs:286` 记录 `full_url()`，含 query。`RUST_LOG=debug` 下 API key、签名 URL 全进日志，违反 DESIGN §9。
   - 文件：`src/proxy.rs` · CC ~5min
 - [ ] **N5（P2）错误响应回显已解析的 IP** — `resolver.rs:187` 把 IP 拼进 `TargetBlocked.message`，`error.rs` 原样序列化。违反 DESIGN §8 明文承诺，构成对外的 DNS 解析预言机（可探测代理视角下内网域名的解析结果）。同类：`connector.rs:218` 泄露 peer_addr。
   - 文件：`src/resolver.rs`、`src/connector.rs` · CC ~10min
@@ -40,12 +40,12 @@
 
 ## 第 3 档 — 代理正确性（P1，与安全边界同批）
 
-- [ ] **N2/E3（P1）Location 解析改写主机名** — `redirect.rs:165-174` 字符串拼接代替 RFC 3986 解析。实测：`next` → `https://example.comnext/`（主机名变了）、`//evil.com/x` → 拼成本机路径、`HTTPS://` 大写不识别、`?q` 丢失原 path。且文档承诺「非法 Location 原样透传 3xx」，代码却抛错。
+- [x] **N2/E3（P1）Location 解析改写主机名** — `redirect.rs:165-174` 字符串拼接代替 RFC 3986 解析。实测：`next` → `https://example.comnext/`（主机名变了）、`//evil.com/x` → 拼成本机路径、`HTTPS://` 大写不识别、`?q` 丢失原 path。且文档承诺「非法 Location 原样透传 3xx」，代码却抛错。
   - 修复：`url::Url::join`（这个轮子就在依赖里）。文件：`src/redirect.rs`、`tests/relay.rs` · CC ~20min
-- [ ] **N3（P1）304 被当重定向跟随** — `proxy.rs:264`、`redirect.rs:93` 用 `(300..400)`。304/300/305/306 全部误处理。条件请求缓存语义失效。
+- [x] **N3（P1）304 被当重定向跟随** — `proxy.rs:264`、`redirect.rs:93` 用 `(300..400)`。304/300/305/306 全部误处理。条件请求缓存语义失效。
   - 注：Codex 指出 304 通常不带 Location，实际触发面小于初判。
   - 修复：跟随集合限定 `301/302/303/307/308`。 · CC ~5min
-- [ ] **N4/E4（P1）IPv6 字面量目标损坏** — `target.rs:220` 的 `authority()` 不加方括号。实测 `[2606:4700::1]:8080` → `"2606:4700::1:8080"`，Host header 畸形、`full_url()` 非法。
+- [x] **N4/E4（P1）IPv6 字面量目标损坏** — `target.rs:220` 的 `authority()` 不加方括号。实测 `[2606:4700::1]:8080` → `"2606:4700::1:8080"`，Host header 畸形、`full_url()` 非法。
   - 注：Codex 指出「环检测必然错误」是过头说法——畸形串仍是一致的 HashSet key，只是不再是合法 canonical URL。
   - 文件：`src/target.rs`、`src/headers.rs`、`tests/relay.rs` · CC ~15min
 - [ ] **N7（P2）上游 Vary 被删除替换** — `headers.rs:57` 删掉上游全部 `Vary`，再写入 CORS-only 的固定值。`Accept-Encoding`/`Accept-Language` 缓存维度丢失，下游缓存可能跨变体返回错误响应。违反 DESIGN §7「保留缓存控制 headers」。
