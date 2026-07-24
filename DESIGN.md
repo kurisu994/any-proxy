@@ -154,6 +154,8 @@ deny 列表覆盖：私网、链路本地（含云元数据 `169.254.169.254`）
 - 卡死由**逐 frame 空闲超时**兜底：上传 `UPLOAD_IDLE_TIMEOUT`，下载 `UPSTREAM_BODY_IDLE_TIMEOUT`。
 - **并发配额覆盖整个响应流的生命周期**（permit 挂在响应 Body 上，流结束才释放），因此 `MAX_CONCURRENT_REQUESTS` 是进程 socket 与上游连接任务的真实上界。
 - 达到上限时**立即返回 `503 service_overloaded`**，不排队：调用方需要知道「过载」而不是看到「卡死」。
+- HTTP/1 解析层的 buffer 与 header 数量上限使用 hyper 默认值，不额外暴露配置。
+- 失败连接按解析出的地址顺序 failover，直到成功或耗尽全部候选地址。
 - 首版禁用所有自动 retry。
 
 > 设计说明：早期版本给整个连接 future 包了一层总时长 timeout（`POOL_IDLE_TIMEOUT`），
@@ -182,43 +184,31 @@ deny 列表覆盖：私网、链路本地（含云元数据 `169.254.169.254`）
 
 响应 headers 一旦发出，后续 Body 错误或 idle timeout 无法改写状态码：中止流，调用方看到截断 Body。
 
-> ⚠️ 已知偏差：错误消息当前会回显解析出的目标 IP（TODOS N5）。
+错误消息不回显解析出的目标 IP / peer_addr，仅记入内部日志，避免成为 DNS 解析预言机。
 
 ## 9. 可观测性与隐私
 
-日志只记录 `request_id`、method、status、duration。
+请求完成日志记录 `request_id`、method、scheme、hostname、port、status、duration；
+流式传输结束或中止时按同一 `request_id` 记录方向与字节计数。
 
 **不得记录** URL query、userinfo、headers、Cookie、Authorization、Body。
 
-> ⚠️ 两处已知偏差：`debug` 级别日志会打印含 query 的完整 URL（TODOS M3）；
-> `telemetry.rs` 中实现了完整字段契约的 API 目前是死代码，运行时用的是简化版（TODOS N13）。
-
 ## 10. 已知偏差汇总
 
-本文档不隐藏实现与意图的差距。以下是 2026-07-24 审查确认、尚未修复的项，全部在 [TODOS.md](TODOS.md) 有条目：
+本文档不隐藏实现与意图的差距。以下是尚未修复的项，全部在 [TODOS.md](TODOS.md) 有条目：
 
 | 领域 | 偏差 | 条目 |
 |------|------|------|
-| header 策略 | trailer 绕过全部清理 | M2 |
-| 隐私 | debug 日志泄露 query | M3 |
-| 错误契约 | 错误响应回显目标 IP | N5 |
-| 地址策略 | 6to4 / Teredo 未拒绝 | E8 |
-| 地址策略 | 宿主刷新失败 fail-open | E7 |
-| 重定向 | Location 相对解析改写主机名 | N2 |
-| 重定向 | 304 / 300 / 305 / 306 误当重定向 | N3 |
-| URL | IPv6 字面量 authority 无方括号 | N4 |
-| 缓存 | 上游 `Vary` 被删除替换 | N7 |
-| 连接 | 只 dial 首个地址，无 failover | N15 |
-| 生命周期 | `SHUTDOWN_GRACE` 不生效 | N6 |
-| 资源 | HTTP/1 buffer 与 header 上限未接线 | E5 |
-| 库边界 | 测试逃生口是公开 API | E2 / E6 |
+| 库边界 | 测试逃生口是公开 API（仅影响 library 复用，二进制走可信路径） | E2 / E6 |
+
+> 2026-07-24 一批安全边界与代理正确性偏差（M2 / M3 / N2 / N3 / N4 / N5 / N7 / E7 / E8 / E9 / N6 / N12 / N13 / N14 / N15 及 E5 的假承诺）已修复，不再列此表。
 
 ## 11. 容器与进程
 
 - 多阶段构建，运行镜像只含二进制、CA 证书和非 root 用户。
 - 只写 stdout/stderr，不依赖可写文件系统。
 - 健康检查用二进制自带的 `health-check` 子命令，不依赖镜像内的 wget/curl。
-- 支持 SIGTERM 优雅关闭（当前实现的偏差见 §10 的 N6）。
+- 支持 SIGTERM 优雅关闭；关闭开始后最多再等 `SHUTDOWN_GRACE`，超时则强制退出，避免活跃连接拖住进程。
 - README 在运行命令之前显示公网匿名开放代理的风险说明。
 
 ## 12. 配置

@@ -54,7 +54,6 @@ const RESPONSE_STRIP: &[&str] = &[
     "access-control-expose-headers",
     "access-control-allow-credentials",
     "access-control-max-age",
-    "vary",
     "server",
     "x-powered-by",
 ];
@@ -109,6 +108,21 @@ pub fn clean_request_headers(headers: &mut http::HeaderMap) {
         if let Ok(hn) = HeaderName::from_bytes(name.as_bytes()) {
             headers.remove(&hn);
         }
+    }
+
+    // 5. 通配删除 Proxy-* 与 X-Forwarded-* 前缀 header
+    //    具名列表只覆盖少数名字，Proxy-Connection、X-Forwarded-Client-Cert 等仍会穿透，
+    //    与 DESIGN §7「移除 Proxy-* / X-Forwarded-*」承诺不符（E9）。
+    let prefixed: Vec<HeaderName> = headers
+        .keys()
+        .filter(|n| {
+            let s = n.as_str();
+            s.starts_with("proxy-") || s.starts_with("x-forwarded-")
+        })
+        .cloned()
+        .collect();
+    for name in prefixed {
+        headers.remove(&name);
     }
 }
 
@@ -166,7 +180,9 @@ pub fn add_cors_headers(headers: &mut http::HeaderMap) {
         "access-control-expose-headers",
         HeaderValue::from_static(EXPOSE_HEADERS),
     );
-    headers.insert(
+    // 追加而非覆盖：保留上游 Vary 的缓存维度（如 Accept-Encoding / Accept-Language），
+    // 只补充 CORS 预检相关维度，避免下游缓存跨变体返回错误响应（N7，DESIGN §7）。
+    headers.append(
         "vary",
         HeaderValue::from_static("Access-Control-Request-Method, Access-Control-Request-Headers"),
     );
@@ -348,6 +364,46 @@ mod tests {
         );
         assert!(headers.get("access-control-expose-headers").is_some());
         assert!(headers.get("vary").is_some());
+    }
+
+    #[test]
+    fn test_clean_response_preserves_upstream_vary() {
+        // N7：上游 Vary 的缓存维度必须保留，不能被 CORS-only 值覆盖
+        let mut headers = http::HeaderMap::new();
+        headers.insert("vary", "Accept-Encoding".parse().unwrap());
+        clean_response_headers(&mut headers);
+        assert_eq!(headers.get("vary").unwrap(), "Accept-Encoding");
+
+        // 追加 CORS 维度后，上游维度仍在（存在多个 Vary 字段）
+        add_cors_headers(&mut headers);
+        let varys: Vec<_> = headers
+            .get_all("vary")
+            .into_iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        assert!(varys.iter().any(|v| v.contains("Accept-Encoding")));
+        assert!(varys
+            .iter()
+            .any(|v| v.contains("Access-Control-Request-Method")));
+    }
+
+    #[test]
+    fn test_clean_request_removes_proxy_and_forwarded_prefixes() {
+        // E9：Proxy-* 与 X-Forwarded-* 前缀通配清理
+        let mut headers = http::HeaderMap::new();
+        headers.insert("proxy-connection", "keep-alive".parse().unwrap());
+        headers.insert("proxy-foo", "bar".parse().unwrap());
+        headers.insert("x-forwarded-client-cert", "cert".parse().unwrap());
+        headers.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
+        headers.insert("content-type", "application/json".parse().unwrap());
+
+        clean_request_headers(&mut headers);
+
+        assert!(headers.get("proxy-connection").is_none());
+        assert!(headers.get("proxy-foo").is_none());
+        assert!(headers.get("x-forwarded-client-cert").is_none());
+        assert!(headers.get("x-forwarded-for").is_none());
+        assert!(headers.get("content-type").is_some()); // 保留
     }
 
     #[test]

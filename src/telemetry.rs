@@ -11,7 +11,6 @@
 //! 日志中的 hostname 也应支持关闭。
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 /// 全局请求 ID 计数器
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -47,49 +46,11 @@ pub fn init_tracing() {
         .try_init();
 }
 
-/// 请求级别的结构化日志 span 参数
-///
-/// 只包含隐私安全的字段：method、scheme、host（可关闭）、port、request_id。
-/// **不包含** query、headers、Cookie、Authorization 或 Body。
-#[derive(Debug, Clone)]
-pub struct RequestLogFields<'a> {
-    pub request_id: &'a str,
-    pub method: &'a str,
-    pub scheme: &'a str,
-    pub host: &'a str,
-    pub port: u16,
-}
-
-/// 请求完成时的结构化日志
-///
-/// 记录最终状态、错误码、持续时间和流式字节计数。
-/// 所有字段经过隐私过滤，不含敏感信息。
-pub fn log_request_complete(
-    fields: &RequestLogFields,
-    status: u16,
-    error_code: Option<&str>,
-    duration: Duration,
-    bytes_sent: u64,
-    bytes_received: u64,
-) {
-    tracing::info!(
-        request_id = %fields.request_id,
-        method = %fields.method,
-        scheme = %fields.scheme,
-        host = %fields.host,
-        port = fields.port,
-        status = status,
-        error_code = ?error_code,
-        duration_ms = duration.as_millis() as u64,
-        bytes_sent = bytes_sent,
-        bytes_received = bytes_received,
-        "request complete"
-    );
-}
-
 /// 流式中止日志
 ///
 /// 响应 headers 已发出后 Body 传输中止时记录。
+/// `request_id` 关联到 `proxy::log_complete` 的 headers 完成日志，
+/// `bytes_sent` 为中止前已透传的字节数（N13）。
 pub fn log_stream_aborted(request_id: &str, reason: &str, bytes_sent: u64) {
     tracing::warn!(
         request_id = %request_id,

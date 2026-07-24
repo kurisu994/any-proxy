@@ -16,10 +16,6 @@ pub struct Config {
     pub listen_addr: SocketAddr,
     /// 最大并发请求数
     pub max_concurrent_requests: usize,
-    /// HTTP/1 parser buffer上限（字节）
-    pub max_http1_buffer_bytes: usize,
-    /// HTTP/1 header 数量上限
-    pub max_headers_count: usize,
     /// URI 字节上限（进入目标解析前检查）
     pub max_uri_bytes: usize,
     /// DNS 解析超时
@@ -45,8 +41,6 @@ impl Default for Config {
         Self {
             listen_addr: "0.0.0.0:8080".parse().unwrap(),
             max_concurrent_requests: 256,
-            max_http1_buffer_bytes: 65536,
-            max_headers_count: 100,
             max_uri_bytes: 16384,
             dns_timeout: Duration::from_secs(5),
             connect_timeout: Duration::from_secs(10),
@@ -94,16 +88,6 @@ impl Config {
             1,
             1_000_000,
         )?;
-
-        config.max_http1_buffer_bytes = env_usize(
-            "MAX_HTTP1_BUFFER_BYTES",
-            config.max_http1_buffer_bytes,
-            1024,
-            1024 * 1024,
-        )?;
-
-        config.max_headers_count =
-            env_usize("MAX_HEADERS_COUNT", config.max_headers_count, 1, 1000)?;
 
         config.max_uri_bytes = env_usize("MAX_URI_BYTES", config.max_uri_bytes, 256, 1_048_576)?;
 

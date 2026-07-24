@@ -33,6 +33,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 http = "1"
 # HTTP Body trait
 http-body = "1"
+# 字节缓冲（Buf trait，用于流式字节计数）
+bytes = "1"
 # 入站 HTTP 服务器
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "original-uri"] }
 # 出站 HTTP/1.1 客户端

@@ -160,12 +160,18 @@ pub fn build_index_response() -> Response<Body> {
 }
 
 /// 构建 /healthz 健康检查响应
+///
+/// 与其他所有响应一致带 CORS headers，便于浏览器侧探活（N14）。
 pub fn build_healthz_response() -> Response<Body> {
-    Response::builder()
+    let mut response = Response::builder()
         .status(StatusCode::OK)
         .header(http::header::CONTENT_TYPE, "text/plain")
         .body(Body::from("ok"))
-        .expect("健康检查响应构建不会失败")
+        .expect("健康检查响应构建不会失败");
+
+    headers::add_cors_headers(response.headers_mut());
+
+    response
 }
 
 #[cfg(test)]
@@ -226,6 +232,8 @@ mod tests {
     fn test_build_healthz_response() {
         let resp = build_healthz_response();
         assert_eq!(resp.status(), StatusCode::OK);
+        // N14：健康检查也带 CORS，便于浏览器探活
+        assert!(resp.headers().get("access-control-allow-origin").is_some());
     }
 
     #[test]

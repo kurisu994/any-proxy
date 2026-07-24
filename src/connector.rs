@@ -206,18 +206,42 @@ where
             });
         }
 
-        // 4. dial 到第一个验证过的地址（带 TCP 连接超时）
-        let dial_record = tokio::time::timeout(self.timeouts.connect, self.dialer.dial(addrs[0]))
-            .await
-            .map_err(|_| crate::ProxyError::ConnectTimeout)??;
-
-        // 5. 验证 peer_addr 属于已验证集合
+        // 4. 依次 dial 已验证地址，任一成功即用（顺序 failover）。
+        //    坏 AAAA 排在可用 A 前面时，仍能连通剩余地址而非整站不可用（N15）。
+        //    每个候选地址各自套 TCP 连接超时。
         let validated_set: HashSet<SocketAddr> = addrs.iter().copied().collect();
-        if !validated_set.contains(&dial_record.peer_addr) {
-            return Err(crate::ProxyError::ConnectFailed {
-                message: format!("peer_addr {} 不属于已验证地址集合", dial_record.peer_addr),
-            });
+        let mut last_err: Option<crate::ProxyError> = None;
+        let mut dial_record: Option<DialRecord> = None;
+        for addr in &addrs {
+            match tokio::time::timeout(self.timeouts.connect, self.dialer.dial(*addr)).await {
+                Ok(Ok(record)) => {
+                    // 5. 验证 peer_addr 属于已验证集合，防止 Dialer 连到集合外地址
+                    if !validated_set.contains(&record.peer_addr) {
+                        // peer_addr 只进内部日志，不回显：错误消息会明文序列化（DESIGN §8，N5）
+                        tracing::warn!(peer_addr = %record.peer_addr, "dial peer 不属于已验证地址集合");
+                        last_err = Some(crate::ProxyError::ConnectFailed {
+                            message: "连接目标校验失败".into(),
+                        });
+                        continue;
+                    }
+                    dial_record = Some(record);
+                    break;
+                }
+                Ok(Err(e)) => {
+                    tracing::debug!(error = %e, "dial 候选地址失败，尝试下一个");
+                    last_err = Some(e);
+                }
+                Err(_) => {
+                    tracing::debug!("dial 候选地址超时，尝试下一个");
+                    last_err = Some(crate::ProxyError::ConnectTimeout);
+                }
+            }
         }
+        let dial_record = dial_record.ok_or_else(|| {
+            last_err.unwrap_or(crate::ProxyError::ConnectFailed {
+                message: "无可用连接地址".into(),
+            })
+        })?;
 
         // 6. HTTPS 目标进行 TLS 握手（带 TLS 超时）
         let stream =
@@ -415,6 +439,42 @@ mod tests {
         }
     }
 
+    /// 假 Dialer：对指定地址失败、其余成功，用于测试顺序 failover（N15）
+    #[derive(Clone)]
+    struct SelectiveDialer {
+        fail_addrs: Arc<HashSet<SocketAddr>>,
+        records: Arc<std::sync::Mutex<Vec<SocketAddr>>>,
+    }
+
+    impl SelectiveDialer {
+        fn new(fail_addrs: Vec<SocketAddr>) -> Self {
+            Self {
+                fail_addrs: Arc::new(fail_addrs.into_iter().collect()),
+                records: Arc::new(std::sync::Mutex::new(vec![])),
+            }
+        }
+
+        fn dial_records(&self) -> Vec<SocketAddr> {
+            self.records.lock().unwrap().clone()
+        }
+    }
+
+    impl Dialer for SelectiveDialer {
+        async fn dial(&self, addr: SocketAddr) -> Result<DialRecord, crate::ProxyError> {
+            self.records.lock().unwrap().push(addr);
+            if self.fail_addrs.contains(&addr) {
+                return Err(crate::ProxyError::ConnectFailed {
+                    message: "模拟 dial 失败".into(),
+                });
+            }
+            let (client, _server) = tokio::io::duplex(64);
+            Ok(DialRecord {
+                peer_addr: addr,
+                stream: BoxStream::new(client),
+            })
+        }
+    }
+
     fn make_target(port: u16) -> Target {
         Target {
             scheme: crate::target::Scheme::Https,
@@ -549,5 +609,40 @@ mod tests {
         assert!(result.is_err());
         // dial 已发生（TCP 连接成功），但 TLS 步骤失败
         assert!(!dialer.dial_records().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_failover_to_second_address() {
+        // 第一个地址 dial 失败，应 failover 到第二个成功（N15）
+        let resolver =
+            FakeResolver::new(vec!["1.2.3.4".parse().unwrap(), "5.6.7.8".parse().unwrap()]);
+        let policy = AddressPolicy::new();
+        let dialer = SelectiveDialer::new(vec!["1.2.3.4:80".parse().unwrap()]);
+        let connector = Connector::new(resolver, policy, dialer.clone());
+
+        let conn = connector.connect(&make_http_target(80)).await.unwrap();
+        assert_eq!(conn.peer_addr, "5.6.7.8:80".parse().unwrap());
+        // 两个地址都被尝试，且顺序正确
+        assert_eq!(
+            dialer.dial_records(),
+            vec!["1.2.3.4:80".parse().unwrap(), "5.6.7.8:80".parse().unwrap()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_failover_all_fail_returns_error() {
+        // 所有地址都失败时返回错误，且每个地址都尝试过（N15）
+        let resolver =
+            FakeResolver::new(vec!["1.2.3.4".parse().unwrap(), "5.6.7.8".parse().unwrap()]);
+        let policy = AddressPolicy::new();
+        let dialer = SelectiveDialer::new(vec![
+            "1.2.3.4:80".parse().unwrap(),
+            "5.6.7.8:80".parse().unwrap(),
+        ]);
+        let connector = Connector::new(resolver, policy, dialer.clone());
+
+        let result = connector.connect(&make_http_target(80)).await;
+        assert!(result.is_err());
+        assert_eq!(dialer.dial_records().len(), 2);
     }
 }

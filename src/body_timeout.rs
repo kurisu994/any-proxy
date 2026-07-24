@@ -11,35 +11,71 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use bytes::Buf;
 use http_body::Body as HttpBody;
 
 /// 包装一个 `HttpBody`，在读取每个 frame 时应用 idle timeout
 ///
 /// 使用 `tokio::time::Sleep`（Box::pin）注册定时器 waker，确保即使 inner body
 /// 永久不产生数据，timeout 也能在指定时间后触发。
+///
+/// 同时累计透传的 data 字节数，用于遥测契约（DESIGN §9，N13）：
+/// 流正常结束记 `stream complete`，中止时 `log_stream_aborted` 带真实
+/// `request_id` 与字节数，替代过去硬编码的 `("unknown", 0)`。
 pub struct IdleTimeoutBody<B> {
     inner: B,
     timeout: Duration,
     /// 定时器：到期后唤醒 poll_frame 检查超时
     sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+    /// 关联的 request_id（多个 body 共享 handler 的 id，用 Arc 避免克隆开销）
+    request_id: Arc<str>,
+    /// 方向标签："upload" / "download"
+    direction: &'static str,
+    /// 已透传的 data 字节累计
+    bytes: u64,
+    /// 是否已记过终态日志，避免重复
+    finished: bool,
 }
 
 impl<B> IdleTimeoutBody<B> {
-    /// 创建 idle timeout body
+    /// 创建 idle timeout body（不带遥测上下文，主要供测试使用）
     pub fn new(inner: B, timeout: Duration) -> Self {
+        Self::with_context(inner, timeout, Arc::from("-"), "stream")
+    }
+
+    /// 创建带遥测上下文的 idle timeout body
+    ///
+    /// `request_id` 关联到 handler 的完成日志，`direction` 标记上传/下载方向。
+    pub fn with_context(
+        inner: B,
+        timeout: Duration,
+        request_id: Arc<str>,
+        direction: &'static str,
+    ) -> Self {
         Self {
             inner,
             timeout,
             sleep: None,
+            request_id,
+            direction,
+            bytes: 0,
+            finished: false,
         }
     }
 
     /// 启动或重置定时器
     fn reset_sleep(&mut self) {
         self.sleep = Some(Box::pin(tokio::time::sleep(self.timeout)));
+    }
+
+    /// 已透传的 data 字节数（测试用）
+    #[cfg(test)]
+    pub(crate) fn bytes_for_test(&self) -> u64 {
+        self.bytes
     }
 }
 
@@ -72,7 +108,14 @@ where
                         timeout_ms = this.timeout.as_millis() as u64,
                         "body idle timeout，中止流"
                     );
-                    crate::telemetry::log_stream_aborted("unknown", "body_idle_timeout", 0);
+                    if !this.finished {
+                        this.finished = true;
+                        crate::telemetry::log_stream_aborted(
+                            &this.request_id,
+                            "body_idle_timeout",
+                            this.bytes,
+                        );
+                    }
                     return Poll::Ready(Some(Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         "body idle timeout",
@@ -86,7 +129,8 @@ where
                     // 有活动，重置定时器
                     this.reset_sleep();
 
-                    if frame.is_data() {
+                    if let Some(data) = frame.data_ref() {
+                        this.bytes += data.remaining() as u64;
                         return Poll::Ready(Some(Ok(frame)));
                     }
 
@@ -99,9 +143,29 @@ where
                 }
                 Poll::Ready(Some(Err(e))) => {
                     tracing::warn!(error = ?e, "body frame 错误");
+                    if !this.finished {
+                        this.finished = true;
+                        crate::telemetry::log_stream_aborted(
+                            &this.request_id,
+                            "body_frame_error",
+                            this.bytes,
+                        );
+                    }
                     return Poll::Ready(Some(Err(std::io::Error::other("body frame error"))));
                 }
-                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Ready(None) => {
+                    // 流正常结束：记完成日志，补全 DESIGN §9 契约的字节计数（N13）
+                    if !this.finished {
+                        this.finished = true;
+                        tracing::debug!(
+                            request_id = %this.request_id,
+                            direction = this.direction,
+                            bytes = this.bytes,
+                            "stream complete"
+                        );
+                    }
+                    return Poll::Ready(None);
+                }
                 Poll::Pending => {
                     // inner 还没数据，定时器已在上面注册了 waker
                     // 当定时器到期或 inner 有数据时都会被唤醒
@@ -114,19 +178,27 @@ where
 
 /// 将 idle timeout 应用于上游响应 body，返回 Axum `Body`
 ///
-/// 使用 `UPSTREAM_BODY_IDLE_TIMEOUT` 配置。
-pub fn wrap_response_body(body: hyper::body::Incoming, timeout: Duration) -> axum::body::Body {
+/// 使用 `UPSTREAM_BODY_IDLE_TIMEOUT` 配置。`request_id` 用于流中止/完成日志。
+pub fn wrap_response_body(
+    body: hyper::body::Incoming,
+    timeout: Duration,
+    request_id: Arc<str>,
+) -> axum::body::Body {
     use http_body_util::BodyExt;
-    let wrapped = IdleTimeoutBody::new(body, timeout);
+    let wrapped = IdleTimeoutBody::with_context(body, timeout, request_id, "download");
     axum::body::Body::new(wrapped.map_err(axum::Error::new))
 }
 
 /// 将 idle timeout 应用于上传请求 body，返回 Axum `Body`
 ///
-/// 使用 `UPLOAD_IDLE_TIMEOUT` 配置。
-pub fn wrap_request_body(body: axum::body::Body, timeout: Duration) -> axum::body::Body {
+/// 使用 `UPLOAD_IDLE_TIMEOUT` 配置。`request_id` 用于流中止/完成日志。
+pub fn wrap_request_body(
+    body: axum::body::Body,
+    timeout: Duration,
+    request_id: Arc<str>,
+) -> axum::body::Body {
     use http_body_util::BodyExt;
-    let wrapped = IdleTimeoutBody::new(body, timeout);
+    let wrapped = IdleTimeoutBody::with_context(body, timeout, request_id, "upload");
     axum::body::Body::new(wrapped.map_err(axum::Error::new))
 }
 
@@ -155,7 +227,9 @@ mod tests {
             let this = self.get_mut();
             if !this.data_sent {
                 this.data_sent = true;
-                return Poll::Ready(Some(Ok(http_body::Frame::data(Bytes::from_static(b"hello")))));
+                return Poll::Ready(Some(Ok(http_body::Frame::data(Bytes::from_static(
+                    b"hello",
+                )))));
             }
             if !this.trailer_sent {
                 this.trailer_sent = true;
@@ -196,5 +270,19 @@ mod tests {
         );
         let collected = body.collect().await.unwrap();
         assert_eq!(collected.to_bytes(), Bytes::from_static(b"hello world"));
+    }
+
+    /// N13：透传 data frame 时按字节累加，供遥测契约使用
+    #[tokio::test]
+    async fn test_byte_count_accumulates() {
+        let mut body = IdleTimeoutBody::new(
+            axum::body::Body::from("hello world"), // 11 字节
+            Duration::from_secs(30),
+        );
+        // 逐帧读完，不消费 body 本身
+        while let Some(frame) = body.frame().await {
+            frame.unwrap();
+        }
+        assert_eq!(body.bytes_for_test(), 11);
     }
 }
