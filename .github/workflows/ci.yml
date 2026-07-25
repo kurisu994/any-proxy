@@ -57,6 +57,13 @@ jobs:
   audit:
     name: cargo-audit
     runs-on: ubuntu-latest
+    # audit-check 会创建 check run 与 issue 来展示结果，缺权限时即使
+    # 「0 个漏洞」也会以 `Resource not accessible by integration` 失败——
+    # 该作业此前一直是红的，原因正是这个而非真有漏洞。
+    permissions:
+      contents: read
+      checks: write
+      issues: write
     steps:
       - uses: actions/checkout@v4
       - name: 依赖安全审计
