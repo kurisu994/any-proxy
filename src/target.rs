@@ -327,6 +327,18 @@ mod tests {
         assert!(parse_target("/ws://example.com/").is_err());
     }
 
+    /// 反向代理（如 Caddy）会对请求路径做规范化，把 `//` 折叠成 `/`，
+    /// 于是 `/https://host/p` 到达本服务时可能变成 `/https:/host/p`。
+    /// WHATWG URL 对 special scheme 会跳过任意数量的斜杠，因此仍应解析成同一目标。
+    /// 这是「置于反向代理之后」这一部署形态的正确性前提，不能回退。
+    #[test]
+    fn test_collapsed_slashes_from_reverse_proxy() {
+        let target = parse_target("/https:/example.com/data?q=1").unwrap();
+        assert_eq!(target.scheme, Scheme::Https);
+        assert_eq!(target.host, Host::Domain("example.com".into()));
+        assert_eq!(target.full_url(), "https://example.com/data?q=1");
+    }
+
     #[test]
     fn test_ipv4_literal() {
         let target = parse_target("/https://1.2.3.4/").unwrap();

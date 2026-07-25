@@ -1,0 +1,33 @@
+# any-proxy 公网 HTTPS 反向代理配置（配合 docker-compose.caddy.yml 使用）
+#
+# 域名由 compose 通过 DOMAIN 环境变量注入，Caddy 会自动申请并续期
+# Let's Encrypt 证书，同时把 HTTP 请求跳转到 HTTPS。
+
+# 默认使用匿名 ACME 账户（Let's Encrypt 允许，签发与续期均正常）。
+# 想收到证书到期与吊销通知，取消下面三行注释并填入真实邮箱：
+#
+# {
+# 	email you@example.com
+# }
+#
+# 注意 `{$ENV}` 是解析前的文本替换，写成 `email {$ACME_EMAIL}` 时
+# 一旦该变量为空，`email` 会变成零参数指令导致 Caddy 启动失败。
+
+{$DOMAIN} {
+	reverse_proxy any-proxy:8080 {
+		# 立即透传每一个数据块，不做响应缓冲。
+		# any-proxy 是流式代理，缓冲会破坏「边收边发」语义并放大内存占用。
+		flush_interval -1
+
+		# 不设置上游响应超时：any-proxy 自身用逐 frame 空闲超时兜底卡死，
+		# 在此加总时长上限会重新引入「长传输被静默截断」的问题（见 TODOS N1）。
+	}
+
+	# 访问日志走 stdout，便于 `docker compose logs` 排查滥用。
+	# 注意：Caddy 默认记录完整 URI（含 query），而 any-proxy 的目标 URL 就在路径里。
+	# 若目标 API 使用 query 传递密钥，请按需关闭此日志或过滤字段。
+	log {
+		output stdout
+		format json
+	}
+}

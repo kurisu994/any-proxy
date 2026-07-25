@@ -89,11 +89,17 @@
   - ⚠️ Codex 指出原 ~1h 估算不可信：它同时覆盖 kill-switch、带宽预算和部署体验，且未定义预算维度、触发行为与恢复流程。需要先拆解。
   - 文件：`.github/workflows/`、`src/telemetry.rs`、`src/config.rs` · CC 待重估
 
-## 第 6 档 — 部署体验（在安全默认之后）
+## 第 6 档 — 部署体验（安全默认已就位，本档解锁）
 
-- [ ] **D3（P1→降序）Caddy TLS 示例** — `docker-compose.caddy.yml` + `Caddyfile`，一键起公网 HTTPS。
+- [x] **D3（P1→降序）Caddy TLS 示例** — `docker-compose.caddy.yml` + `Caddyfile`，一键起公网 HTTPS。
   - ⚠️ **顺序已调整**：原本排在 A 档最前。Codex 指出它会让服务更容易公网暴露，必须排在安全默认（C1）之后，否则等于加速推广一个不可运营的默认配置。
-  - 文件：`docker-compose.caddy.yml`（新建）、`Caddyfile`（新建）、`README.md` · CC ~20min
+  - 实现（2026-07-25）：`Caddyfile`（自动 ACME、`flush_interval -1` 关闭响应缓冲、不设上游响应超时以免重新引入 N1 式截断）；`docker-compose.caddy.yml`（any-proxy 不映射宿主端口只走内部网络；`DOMAIN` 用 `${VAR:?}` 强制并给中文提示；两容器均加固，Caddy 保留 `NET_BIND_SERVICE`）。
+  - **默认收紧**：Caddy 编排默认带安全带 `ALLOW_TARGETS=api.github.com` / `ALLOW_PORTS=80,443` / `RATE_LIMIT_RPS=10` / `MAX_EGRESS_BYTES=10GiB`，放宽是显式选择——这正是排在 C1 之后的意义。
+  - 顺带确认的部署前提：反代会把 `//` 折叠成 `/`，`parse_target` 依赖 WHATWG「special scheme 跳过任意数量斜杠」仍能正确解析，已加回归测试 `target::tests::test_collapsed_slashes_from_reverse_proxy` 锁定，故不需要 Caddy 侧重写规则。
+  - ⚠️ 未验证：本机 Docker daemon 未运行，`Caddyfile` 语法与镜像构建**未实跑**，只做了 `docker compose config` 客户端校验。首次部署请留意 Caddy 启动日志。
+- [x] **（P1）Dockerfile 的 Rust 版本低于 MSRV** — 上一批把真实 MSRV 从 1.75 修正为 1.86 时漏改 Dockerfile，构建镜像仍用 `rust:1.83-bookworm`，低于 `url`/`icu` 传递依赖要求，`docker build` 必然在依赖预编译阶段失败（且 CI 不构建镜像，无人拦截）。
+  - 修复：`rust:1.83-bookworm` → `rust:1.86-bookworm`，并加注释说明必须 >= `Cargo.toml` 的 `rust-version`。文件：`Dockerfile`
+  - 遗留：CI 仍不构建镜像，这类漂移下次仍无自动拦截——由「多架构镜像」项一并解决。
 - [ ] **D6（P2→提前）版本端点与预构建镜像** — ✅ 版本端点已做：`/healthz` 回显 `{"status":"ok","version":"…"}`（`src/error.rs`）。⏳ 预构建镜像 + SemVer tag + 固定版本 compose 待做（与「多架构镜像」合并处理）。
   - ⚠️ Codex 建议提前：「目标用户不该先本地编译 Rust」，这是当前最大的分发摩擦之一。
   - 文件：`src/error.rs`（已改）、`docker-compose.yml`、`.github/workflows/`

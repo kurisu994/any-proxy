@@ -69,6 +69,30 @@ curl http://localhost:8080/healthz
 # {"status":"ok","version":"0.1.0"}
 ```
 
+### 公网 HTTPS（Caddy 自动 TLS）
+
+仓库自带 `docker-compose.caddy.yml` + `Caddyfile`，一条命令起一个带证书的公网实例：
+
+```bash
+DOMAIN=proxy.example.com docker compose -f docker-compose.caddy.yml up -d
+```
+
+前提：`DOMAIN` 的 A/AAAA 记录已指向本机公网 IP，且 80/443 可从公网访问（Caddy 走 ACME 挑战签发 Let's Encrypt 证书）。
+
+这套编排与单机 `docker-compose.yml` 有三点不同，都是刻意的：
+
+- **any-proxy 不映射宿主端口**，只在 compose 内部网络可达，公网入口只有 Caddy。
+- **默认带安全带**：`ALLOW_TARGETS=api.github.com`、`ALLOW_PORTS=80,443`、`RATE_LIMIT_RPS=10`、`MAX_EGRESS_BYTES=10GiB`。公网 HTTPS 降低了暴露门槛，所以默认必须收紧，放宽是显式选择：
+
+  ```bash
+  DOMAIN=proxy.example.com ALLOW_TARGETS=.example.com,api.github.com \
+    docker compose -f docker-compose.caddy.yml up -d
+  ```
+
+- **Caddy 关闭响应缓冲**（`flush_interval -1`）且不设上游响应超时，保持流式语义与「没有总时长上限」的约定。
+
+反向代理会把请求路径里的 `//` 折叠成 `/`，因此到达本服务的可能是 `/https:/api.github.com/zen`。这是被支持的形态（回归测试 `target::tests::test_collapsed_slashes_from_reverse_proxy` 锁定），无需额外重写规则。Caddy 注入的 `X-Forwarded-*` 也会被请求 header 清理通配删除，不会转发给上游。
+
 ### 冒烟测试
 
 代理一个真实公共 API（`-i` 可看到代理补上的 CORS 响应头）：

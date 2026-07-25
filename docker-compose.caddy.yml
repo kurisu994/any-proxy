@@ -1,0 +1,72 @@
+# 公网 HTTPS 一键部署：Caddy 自动 TLS + any-proxy
+#
+#   DOMAIN=proxy.example.com docker compose -f docker-compose.caddy.yml up -d
+#
+# 前提条件：
+#   1. DOMAIN 的 A/AAAA 记录已指向本机公网 IP
+#   2. 公网可访问本机 80 与 443 端口（Caddy 走 ACME HTTP-01 / TLS-ALPN-01 挑战签发证书）
+#
+# 安全说明：本文件的 any-proxy 默认带安全带（只允许一个目标域名 + 限速 + 出口预算）。
+# 这是刻意的——公网 HTTPS 降低了暴露门槛，默认必须是收紧的，放宽是你的显式选择。
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80" # ACME HTTP-01 挑战与 HTTP→HTTPS 跳转
+      - "443:443"
+      - "443:443/udp" # HTTP/3
+    environment:
+      - DOMAIN=${DOMAIN:?请设置域名，例如：DOMAIN=proxy.example.com docker compose -f docker-compose.caddy.yml up -d}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # 证书与 ACME 账户必须持久化，否则每次重建都会重新申请，容易触发 Let's Encrypt 限流
+      - caddy_data:/data
+      - caddy_config:/config
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE # 绑定 80/443 低端口所需
+    security_opt:
+      - "no-new-privileges:true"
+    depends_on:
+      - any-proxy
+
+  any-proxy:
+    build: .
+    image: any-proxy:latest
+    restart: unless-stopped
+    # 不映射宿主端口：只在 compose 内部网络可达，公网入口只有 Caddy 一个
+    expose:
+      - "8080"
+    environment:
+      - LISTEN_ADDR=0.0.0.0:8080
+      - RUST_LOG=info
+      # 安全带：默认只放行一个目标域名。改成你真正要代理的目标（逗号分隔，
+      # `.example.com` 形式匹配子域）。放宽即意味着你为该目标的带宽与滥用负责。
+      - ALLOW_TARGETS=${ALLOW_TARGETS:-api.github.com}
+      - ALLOW_PORTS=${ALLOW_PORTS:-80,443}
+      # 带宽账单兜底：全局令牌桶限速 + 进程累计出口字节上限（重启重置）
+      - RATE_LIMIT_RPS=${RATE_LIMIT_RPS:-10}
+      - MAX_EGRESS_BYTES=${MAX_EGRESS_BYTES:-10737418240} # 10 GiB
+      - MAX_CONCURRENT_REQUESTS=${MAX_CONCURRENT_REQUESTS:-256}
+      - DENY_CIDRS=${DENY_CIDRS:-}
+    healthcheck:
+      test: ["CMD", "any-proxy", "health-check"]
+      interval: 30s
+      timeout: 5s
+      start_period: 3s
+      retries: 3
+    # 容器加固（同 docker-compose.yml，N11）
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    mem_limit: 256m
+    pids_limit: 256
+
+volumes:
+  caddy_data:
+  caddy_config:

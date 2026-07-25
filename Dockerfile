@@ -1,5 +1,7 @@
 # 多阶段构建：构建阶段
-FROM rust:1.83-bookworm AS builder
+# 版本必须 >= Cargo.toml 的 rust-version（MSRV 1.86，受 url/icu 传递依赖约束），
+# 否则镜像构建会在依赖预编译阶段直接失败。
+FROM rust:1.86-bookworm AS builder
 
 WORKDIR /build
 
