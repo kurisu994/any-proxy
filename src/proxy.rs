@@ -496,3 +496,345 @@ fn log_complete(
         "request complete"
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connector::{BoxStream, DialRecord};
+    use crate::resolver::{AddressPolicy, ResolveResult};
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// 假 Resolver：固定解析到 loopback，并记录调用次数
+    struct CountingResolver {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Resolver for CountingResolver {
+        async fn resolve(&self, _host: &str) -> Result<ResolveResult, crate::ProxyError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ResolveResult {
+                addresses: vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)],
+            })
+        }
+    }
+
+    /// 假 Dialer：在内存 duplex 的对端扮演上游，回放预设响应并记录收到的请求原文。
+    /// `dials` 用于断言「某类请求根本没有触达网络」。
+    #[derive(Clone)]
+    struct ScriptedDialer {
+        dials: Arc<AtomicUsize>,
+        response: Arc<str>,
+        seen_requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ScriptedDialer {
+        fn new(response: &str) -> Self {
+            Self {
+                dials: Arc::new(AtomicUsize::new(0)),
+                response: Arc::from(response),
+                seen_requests: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl Dialer for ScriptedDialer {
+        async fn dial(&self, addr: SocketAddr) -> Result<DialRecord, crate::ProxyError> {
+            self.dials.fetch_add(1, Ordering::SeqCst);
+            let (client, mut server) = tokio::io::duplex(16 * 1024);
+            let response = self.response.clone();
+            let seen = self.seen_requests.clone();
+
+            tokio::spawn(async move {
+                // 读到 header 结束即可（本组测试的请求都无 body）
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while let Ok(n) = server.read(&mut chunk).await {
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                seen.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf).to_string());
+                let _ = server.write_all(response.as_bytes()).await;
+                let _ = server.flush().await;
+            });
+
+            Ok(DialRecord {
+                peer_addr: addr,
+                stream: BoxStream::new(client),
+            })
+        }
+    }
+
+    fn state_with(
+        config: Config,
+        dialer: ScriptedDialer,
+    ) -> (
+        ProxyState<CountingResolver, ScriptedDialer>,
+        Arc<AtomicUsize>,
+    ) {
+        let resolve_calls = Arc::new(AtomicUsize::new(0));
+        let resolver = CountingResolver {
+            calls: resolve_calls.clone(),
+        };
+        let connector = Arc::new(Connector::new(
+            resolver,
+            AddressPolicy::allow_all_for_test(),
+            dialer,
+        ));
+        let budget = Arc::new(crate::budget::Budget::new(
+            config.max_egress_bytes,
+            config.rate_limit_rps,
+        ));
+        (
+            ProxyState {
+                connector,
+                config: Arc::new(config),
+                budget,
+            },
+            resolve_calls,
+        )
+    }
+
+    /// 驱动一次 proxy_handler 调用
+    async fn call(
+        state: ProxyState<CountingResolver, ScriptedDialer>,
+        method: &str,
+        path: &str,
+        headers: Vec<(&str, &str)>,
+    ) -> Response {
+        let mut hm = http::HeaderMap::new();
+        for (k, v) in headers {
+            hm.insert(
+                http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                http::HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        proxy_handler(
+            State(state),
+            OriginalUri(path.parse::<http::Uri>().unwrap()),
+            http::Method::from_bytes(method.as_bytes()).unwrap(),
+            hm,
+            Body::empty(),
+        )
+        .await
+    }
+
+    const OK_RESPONSE: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+
+    /// 未授权请求必须在触碰网络之前就被拒绝。
+    ///
+    /// 这是安全属性而非性能优化：若 401 之前就发生 DNS 解析或 dial，
+    /// 未授权调用方即可拿代理当 DNS 预言机 / 端口探测器（对照 N5 的同类问题）。
+    #[tokio::test]
+    async fn test_unauthorized_request_never_resolves_or_dials() {
+        let dialer = ScriptedDialer::new(OK_RESPONSE);
+        let config = Config {
+            auth_token: Some("secret".into()),
+            ..Default::default()
+        };
+        let (state, resolve_calls) = state_with(config, dialer.clone());
+
+        let resp = call(state, "GET", "/http://example.com/x", vec![]).await;
+
+        assert_eq!(resp.status(), 401);
+        assert_eq!(resolve_calls.load(Ordering::SeqCst), 0, "不应发生 DNS 解析");
+        assert_eq!(dialer.dials.load(Ordering::SeqCst), 0, "不应发生 dial");
+    }
+
+    /// 不在 allowlist 的目标同样必须在解析/连接之前拒绝
+    #[tokio::test]
+    async fn test_blocked_target_never_resolves_or_dials() {
+        let dialer = ScriptedDialer::new(OK_RESPONSE);
+        let config = Config {
+            allow_targets: vec!["allowed.example".into()],
+            ..Default::default()
+        };
+        let (state, resolve_calls) = state_with(config, dialer.clone());
+
+        let resp = call(state, "GET", "/http://blocked.example/x", vec![]).await;
+
+        assert_eq!(resp.status(), 403);
+        assert_eq!(resolve_calls.load(Ordering::SeqCst), 0, "不应发生 DNS 解析");
+        assert_eq!(dialer.dials.load(Ordering::SeqCst), 0, "不应发生 dial");
+    }
+
+    /// 限速拒绝也发生在触网之前（C1 批次 2 准入检查的位置）
+    #[tokio::test]
+    async fn test_rate_limited_never_dials() {
+        let dialer = ScriptedDialer::new(OK_RESPONSE);
+        let config = Config {
+            rate_limit_rps: Some(1),
+            ..Default::default()
+        };
+        let (state, _) = state_with(config, dialer.clone());
+
+        // 第一次消耗掉令牌桶容量后，后续请求应被限速
+        let mut last = call(state.clone(), "GET", "/http://example.com/a", vec![]).await;
+        for _ in 0..5 {
+            if last.status() == 429 {
+                break;
+            }
+            last = call(state.clone(), "GET", "/http://example.com/a", vec![]).await;
+        }
+
+        assert_eq!(last.status(), 429, "耗尽令牌后应返回 429");
+        let dials = dialer.dials.load(Ordering::SeqCst);
+        assert!(dials >= 1, "被放行的请求应有 dial");
+        // 被限速的那次不得 dial：dial 次数必须严格少于总请求数
+        assert!(dials < 6, "被限速的请求不应触发 dial，实际 dial {dials} 次");
+    }
+
+    /// `/healthz` 豁免 AUTH_TOKEN：监控探针通常无法携带自定义 header，
+    /// 若健康检查也要鉴权，编排系统会把存活实例误判为不健康。
+    #[tokio::test]
+    async fn test_healthz_exempt_from_auth_token() {
+        let dialer = ScriptedDialer::new(OK_RESPONSE);
+        let config = Config {
+            auth_token: Some("secret".into()),
+            ..Default::default()
+        };
+        let (state, _) = state_with(config, dialer);
+
+        let resp = call(state, "GET", "/healthz", vec![]).await;
+        assert_eq!(resp.status(), 200, "/healthz 不应被 AUTH_TOKEN 拦截");
+    }
+
+    /// 配置 ALLOW_ORIGINS 且 Origin 命中时，回显具体 origin 并追加 `Vary: Origin`。
+    /// 回显具体值而非 `*` 时缺少 Vary，会让共享缓存把 A 站的响应发给 B 站。
+    #[tokio::test]
+    async fn test_allowed_origin_echoed_with_vary() {
+        let dialer = ScriptedDialer::new(OK_RESPONSE);
+        let config = Config {
+            allow_origins: vec!["https://app.example".into()],
+            ..Default::default()
+        };
+        let (state, _) = state_with(config, dialer);
+
+        let resp = call(
+            state,
+            "GET",
+            "/http://example.com/x",
+            vec![("origin", "https://app.example")],
+        )
+        .await;
+
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.headers().get("access-control-allow-origin").unwrap(),
+            "https://app.example",
+            "应回显具体 origin 而非 *"
+        );
+        let vary: Vec<_> = resp
+            .headers()
+            .get_all("vary")
+            .iter()
+            .map(|v| v.to_str().unwrap().to_ascii_lowercase())
+            .collect();
+        assert!(
+            vary.iter().any(|v| v.contains("origin")),
+            "回显具体 origin 时必须带 Vary: Origin，实际 {vary:?}"
+        );
+    }
+
+    /// 不匹配的 Origin 被拒，且错误 message 不回显 origin 原值（对照 N5）
+    #[tokio::test]
+    async fn test_disallowed_origin_blocked_without_echo() {
+        let dialer = ScriptedDialer::new(OK_RESPONSE);
+        let config = Config {
+            allow_origins: vec!["https://app.example".into()],
+            ..Default::default()
+        };
+        let (state, _) = state_with(config, dialer.clone());
+
+        let resp = call(
+            state,
+            "GET",
+            "/http://example.com/x",
+            vec![("origin", "https://evil.example")],
+        )
+        .await;
+
+        assert_eq!(resp.status(), 403);
+        assert_eq!(dialer.dials.load(Ordering::SeqCst), 0, "不应发生 dial");
+
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("evil.example"),
+            "错误响应不应回显 origin 原值: {text}"
+        );
+    }
+
+    /// 转发给上游的 Host 必须按目标重建，而不是透传入站 Host。
+    /// 透传会让上游看到代理自己的主机名，虚拟主机路由随之出错。
+    #[tokio::test]
+    async fn test_host_header_rebuilt_from_target() {
+        let dialer = ScriptedDialer::new(OK_RESPONSE);
+        let (state, _) = state_with(Config::default(), dialer.clone());
+
+        let resp = call(
+            state,
+            "GET",
+            "/http://upstream.example:8080/x",
+            vec![("host", "proxy.local")],
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+
+        let seen = dialer.seen_requests.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "应恰好触达上游一次");
+        let lower = seen[0].to_ascii_lowercase();
+        assert!(
+            lower.contains("host: upstream.example:8080"),
+            "Host 应按目标重建，实际请求:\n{}",
+            seen[0]
+        );
+        assert!(
+            !lower.contains("proxy.local"),
+            "不应透传入站 Host，实际请求:\n{}",
+            seen[0]
+        );
+    }
+
+    /// 不支持的方法在解析目标之前就返回 405，且不触网
+    #[tokio::test]
+    async fn test_trace_method_rejected_before_dial() {
+        let dialer = ScriptedDialer::new(OK_RESPONSE);
+        let (state, resolve_calls) = state_with(Config::default(), dialer.clone());
+
+        let resp = call(state, "TRACE", "/http://example.com/x", vec![]).await;
+
+        assert_eq!(resp.status(), 405);
+        assert_eq!(resolve_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(dialer.dials.load(Ordering::SeqCst), 0);
+    }
+
+    /// URI 超长在任何解析动作之前被拒（防止超大输入进入解析路径）
+    #[tokio::test]
+    async fn test_oversized_uri_rejected_before_parse() {
+        let dialer = ScriptedDialer::new(OK_RESPONSE);
+        let config = Config {
+            max_uri_bytes: 32,
+            ..Default::default()
+        };
+        let (state, resolve_calls) = state_with(config, dialer.clone());
+
+        let long_path = format!("/http://example.com/{}", "a".repeat(200));
+        let resp = call(state, "GET", &long_path, vec![]).await;
+
+        assert_eq!(resp.status(), 400);
+        assert_eq!(resolve_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(dialer.dials.load(Ordering::SeqCst), 0);
+    }
+}

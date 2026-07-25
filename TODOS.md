@@ -96,7 +96,12 @@
   - 实现（2026-07-25）：`Caddyfile`（自动 ACME、`flush_interval -1` 关闭响应缓冲、不设上游响应超时以免重新引入 N1 式截断）；`docker-compose.caddy.yml`（any-proxy 不映射宿主端口只走内部网络；`DOMAIN` 用 `${VAR:?}` 强制并给中文提示；两容器均加固，Caddy 保留 `NET_BIND_SERVICE`）。
   - **默认收紧**：Caddy 编排默认带安全带 `ALLOW_TARGETS=api.github.com` / `ALLOW_PORTS=80,443` / `RATE_LIMIT_RPS=10` / `MAX_EGRESS_BYTES=10GiB`，放宽是显式选择——这正是排在 C1 之后的意义。
   - 顺带确认的部署前提：反代会把 `//` 折叠成 `/`，`parse_target` 依赖 WHATWG「special scheme 跳过任意数量斜杠」仍能正确解析，已加回归测试 `target::tests::test_collapsed_slashes_from_reverse_proxy` 锁定，故不需要 Caddy 侧重写规则。
-  - ⚠️ 未验证：本机 Docker daemon 未运行，`Caddyfile` 语法与镜像构建**未实跑**，只做了 `docker compose config` 客户端校验。首次部署请留意 Caddy 启动日志。
+  - ✅ 已验证（2026-07-25 补）：`caddy validate` 实跑返回 `Valid configuration`（含自动 HTTP→HTTPS 跳转与 TLS 策略生效的日志）；两个 compose 文件 `docker compose config` 通过，含缺 `DOMAIN` 时的中文报错与 `ANY_PROXY_IMAGE` 覆盖。
+- [x] **（P0）镜像里打的是空占位二进制** — 2026-07-25 实跑镜像时发现：容器启动后**立即退出 0、零日志、不监听端口**。镜像内 `/usr/local/bin/any-proxy` 只有 332 KB（真实二进制 3.3 MB），且不含 `拒绝启动` 等任何真实代码字符串——打进去的是依赖缓存层那个 `fn main() {}` 占位程序。
+  - 根因：cargo 按 mtime 判断新鲜度。`COPY src/ src/` 保留源文件原始 mtime，早于上一层 dummy 预编译产物的时间，cargo 遂认为「无需重编译」，直接复用空二进制。**全程零构建错误**。
+  - 这是上一批 N11 修复引入的回归：修复前 dummy 预编译因缺 `lib.rs` 而失败、被 `|| true` 吞掉 → 无产物 → 每次全量重编（二进制反而是对的）；修复后预编译成功 → 产生 stale 产物 → 触发本 bug。**若未发现，首个发布的 v0.1.0 镜像会是完全不能用的空程序。**
+  - 修复：`RUN touch src/*.rs && cargo build --release --locked`。文件：`Dockerfile`
+  - 验证：重建后镜像内二进制 3.3 MB；启动 gate 拒绝启动（退出码 1 + 文案）、带 `ALLOW_TARGETS` 时 `/healthz` 返回 `{"status":"ok","version":"0.1.0"}`、`health-check` 子命令退出 0，三条断言全通过。
 - [x] **（P1）Dockerfile 的 Rust 版本低于 MSRV** — 上一批把真实 MSRV 从 1.75 修正为 1.86 时漏改 Dockerfile，构建镜像仍用 `rust:1.83-bookworm`，低于 `url`/`icu` 传递依赖要求，`docker build` 必然在依赖预编译阶段失败（且 CI 不构建镜像，无人拦截）。
   - 修复：`rust:1.83-bookworm` → `rust:1.86-bookworm`，并加注释说明必须 >= `Cargo.toml` 的 `rust-version`。文件：`Dockerfile`
   - 遗留：CI 仍不构建镜像，这类漂移下次仍无自动拦截——由「多架构镜像」项一并解决。
@@ -108,12 +113,14 @@
 
 ## 第 7 档 — 测试与供应链
 
-- [ ] **N10（P2）测试基础设施与覆盖缺口** — 详见 `~/.gstack/projects/kurisu994-any-proxy/kurisu-main-autoplan-test-plan-20260724.md`。本批已补齐核心盲区，剩余留后续：
+- [x] **N10（P2）测试基础设施与覆盖缺口** — 详见 `~/.gstack/projects/kurisu994-any-proxy/kurisu-main-autoplan-test-plan-20260724.md`。2026-07-25 收尾：
   - ✅ **录制式假上游先决条件**：`tests/fixture.rs::RecordingServer` 完整解析并记录请求（method/path/headers/body，含 chunked 解码），可编程响应（支持 3xx）
   - ✅ **POST/PUT/PATCH/DELETE 端到端**：`test_methods_with_body_forwarded` 断言 method/path/body 转发正确与 Host 重建
   - ✅ **端到端重定向**：`test_redirect_followed_end_to_end` 是首个真正产生 3xx 的端到端测试，兼验 N2 相对 Location 解析
   - ✅ trailer 丢弃测试（`body_timeout::test_trailer_frame_dropped`）、body 字节计数测试（本批 N13）
-  - ⏳ 剩余：`src/proxy.rs` 仍缺针对性单测；`test_streaming_256mib` 仍只数字节不测内存；`test_redirect_chain_multiple_connects` 名不副实，待重构/重命名
+  - ✅ **`src/proxy.rs` 针对性单测**（9 个）：新增 `ScriptedDialer`（内存 duplex 扮演上游、记录 dial 次数与请求原文）+ `CountingResolver`。核心断言是**「被拒请求不得触网」**——401/403/429/405/URI 超长五条路径均断言 `resolve` 与 `dial` 调用次数为 0。这是安全属性而非性能优化：若拒绝发生在解析/连接之后，未授权调用方即可拿代理当 DNS 预言机与端口探测器。另覆盖 `/healthz` 豁免 AUTH_TOKEN、Origin 回显带 `Vary: Origin`、拒绝时不回显 origin 原值、Host 按目标重建不透传入站值。
+  - ✅ **内存维度**：新增 `tests/streaming_memory.rs`，用 `#[global_allocator]` 记录峰值堆占用，断言传输 256 MiB 期间峰值增量 < 32 MiB。单独 test binary（全局分配器是进程级的，并行会被别的测试污染计数）。**已做负向验证**：把客户端改成累积缓冲后峰值 724 MiB 并正确失败，证明阈值确实能区分流式与整体缓冲。原 `test_streaming_256mib` 只数字节——而字节数对两种实现完全一样——已缩为 4 MiB 的 `test_streaming_1mib_chunks_relayed_intact` 只管中继完整性，256 MiB 版本由新测试接管。
+  - ✅ **重命名**：`test_redirect_chain_multiple_connects` → `test_connector_reusable_across_targets`，并在注释里写明它不涉及重定向语义（无 3xx、无 Location、不过 RedirectMachine），真正的端到端重定向覆盖指向 `relay.rs::test_redirect_followed_end_to_end`。
 - [x] **（P3）CI 盲区：clippy 未覆盖测试代码** — CI 跑 `cargo clippy -- -D warnings`，不带 `--all-targets`，因此 `tests/` 里的 lint 长期未被拦截。应改为 `cargo clippy --all-targets -- -D warnings`。
   - 文件：`.github/workflows/ci.yml` · CC ~2min
 - [x] **（P3）CI 无 MSRV 作业** — `rust-version = "1.75"` 从未被验证，CI 只跑 stable。
@@ -130,7 +137,9 @@
   - ⏳ **待你操作**：镜像需先打第一个 tag（`v0.1.0`）才存在；发布后还要在 GitHub package 设置里把可见性改为 Public，否则匿名 `docker pull` 失败。在此之前 caddy 编排需用 `ANY_PROXY_IMAGE=any-proxy:dev` 配合本地构建。
 - [x] **（P2）CI 镜像构建与容器冒烟** — 此前 CI 完全不碰 Dockerfile，导致 MSRV 1.75→1.86 修正时漏改构建镜像版本、`docker build` 静默坏掉无人拦截（本轮才发现）。
   - 实现：`ci.yml` 新增 `docker` 作业——构建镜像 → 断言启动 gate 拒绝「无防护 + 非 loopback 监听」 → 带 `ALLOW_TARGETS` 启动后校验 `/healthz` 状态与版本号 → 校验 `health-check` 子命令（compose healthcheck 依赖它）。
-  - 顺带覆盖了原第 7 档 P3「容器启动测试」的主体。
+  - 顺带覆盖了原第 7 档 P3「容器启动测试」的主体。**并且它立刻兑现了价值**：正是本地实跑这套断言时抓到了上面那个「镜像内是空占位二进制」的 P0。
+  - ⚠️ 曾埋过假阳性：gate 断言最初写成「`docker run` 非零退出即通过」，而镜像不存在(125)、拉取失败、OOM 全是非零，会让该断言永远通过。已改为**必须退出码恰好为 1 且输出含「拒绝启动」**。
+  - 验证：三条断言已在本地 Docker 实跑通过（非仅 YAML 语法校验）。
 - [ ] **（P3）SBOM / provenance** — 后置。容器启动测试已由上面的 CI `docker` 作业覆盖。
   - 注：`release.yml` 目前显式 `provenance: false`（开启会在 push-by-digest 模式下污染 manifest）。要做时需连带处理 attestation 与 manifest list 的合成方式。
 - [ ] **（P3）Prometheus exporter** — 后置。Codex：「在尚无用户验证时把 M2 定义成 SBOM/provenance/Prometheus，是供应链成熟度领先于产品成熟度」。

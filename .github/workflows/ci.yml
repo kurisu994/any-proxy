@@ -85,8 +85,16 @@ jobs:
 
       - name: 启动 gate 应拒绝「无防护 + 非 loopback 监听」
         run: |
-          if docker run --rm -e LISTEN_ADDR=0.0.0.0:8080 any-proxy:ci; then
-            echo "::error::启动 gate 失效：无防护的 0.0.0.0 监听竟然启动成功"
+          set +e
+          out=$(docker run --rm -e LISTEN_ADDR=0.0.0.0:8080 any-proxy:ci 2>&1)
+          rc=$?
+          set -e
+          echo "$out"
+          # 必须是进程自己的 exit(1) 且打印了 gate 文案。
+          # 只断言「非零退出」是假阳性陷阱：镜像不存在(125)、拉取失败、OOM
+          # 全都是非零，会被误判成「gate 生效」而让测试变成永远通过。
+          if [ "$rc" -ne 1 ] || ! echo "$out" | grep -q "拒绝启动"; then
+            echo "::error::启动 gate 未按预期工作（退出码 $rc，期望 1 且输出含「拒绝启动」）"
             exit 1
           fi
           echo "启动 gate 按预期拒绝启动"
@@ -96,10 +104,16 @@ jobs:
           docker run -d --name smoke -p 8080:8080 \
             -e LISTEN_ADDR=0.0.0.0:8080 -e ALLOW_TARGETS=api.github.com \
             any-proxy:ci
+          ok=
           for _ in $(seq 1 20); do
-            curl -fsS http://127.0.0.1:8080/healthz -o /tmp/healthz.json && break
+            curl -fsS http://127.0.0.1:8080/healthz -o /tmp/healthz.json && { ok=1; break; }
             sleep 1
           done
+          if [ -z "$ok" ]; then
+            echo "::error::容器启动后 20 秒内 /healthz 仍不可用，容器日志："
+            docker logs smoke
+            exit 1
+          fi
           cat /tmp/healthz.json
           grep -q '"status":"ok"' /tmp/healthz.json
           # 回显版本须与 Cargo.toml 一致，否则镜像版本无法追溯

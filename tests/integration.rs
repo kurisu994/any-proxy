@@ -86,11 +86,16 @@ async fn test_https_get_local_fixture() {
     server.shutdown();
 }
 
-/// 测试 3: 重定向链 — Connector 可用于多跳连接
+/// 测试 3: 同一 Connector 可跨不同目标复用
 ///
-/// 验证 Connector 可以连续建立多个连接（模拟重定向场景）。
+/// 验证一个 Connector 实例能连续对不同目标建立独立连接，各自绑定到正确的 peer_addr。
+/// 重定向跟随正是靠这个性质逐跳重连的。
+///
+/// 注意本测试**不涉及重定向语义**：没有 3xx、没有 Location 解析、不经过 RedirectMachine。
+/// 它此前叫 `test_redirect_chain_multiple_connects`，名字暗示了并不存在的覆盖（N10）。
+/// 真正的端到端重定向覆盖见 `tests/relay.rs::test_redirect_followed_end_to_end`。
 #[tokio::test]
-async fn test_redirect_chain_multiple_connects() {
+async fn test_connector_reusable_across_targets() {
     let server1 = fixture::TestServer::start_http().await;
     let server2 = fixture::TestServer::start_http().await;
 

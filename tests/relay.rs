@@ -318,11 +318,15 @@ async fn test_private_target_blocked() {
 /// 使用 chunked transfer encoding 分块发送 256 MiB 数据，
 /// 验证代理能完整转发而不超时或缓冲。
 #[tokio::test]
-async fn test_streaming_256mib() {
-    // 256 MiB = 256 * 1024 * 1024 bytes
-    // 使用 1 MiB chunk * 256 chunks = 256 MiB
+async fn test_streaming_1mib_chunks_relayed_intact() {
+    // 小体量版本：只验证 chunked 中继的字节完整性，跑得快、可与其他测试并行。
+    //
+    // 256 MiB 的版本已迁到 `tests/streaming_memory.rs`：原先那个 256 MiB 测试
+    // 把整个响应读进 Vec 再数字节，而字节数对「真流式」和「整体缓冲」是一样的，
+    // 证明不了 M1 成功标准 3。新测试用全局分配器断言峰值堆占用，
+    // 并且同样校验了 payload 完整性，严格覆盖此处（N10）。
     let chunk_size = 1024 * 1024; // 1 MiB
-    let chunk_count = 256;
+    let chunk_count = 4;
     let total_size = chunk_size * chunk_count;
 
     let server =
@@ -358,7 +362,6 @@ async fn test_streaming_256mib() {
     let resp_str = String::from_utf8_lossy(&response);
     assert!(resp_str.contains("200 OK"), "应返回 200 OK");
 
-    // 验证接收到的 body 数据量至少 256 MiB
     // chunked encoding 的 chunk header 中可能包含 'A'（hex digit），所以用 >=
     let a_count = response.iter().filter(|&&b| b == b'A').count();
     assert!(

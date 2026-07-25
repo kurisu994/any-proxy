@@ -15,9 +15,14 @@ RUN mkdir src && \
     cargo build --release --locked && \
     rm -rf src
 
-# 复制实际源码并构建 release 二进制（依赖层已缓存）
+# 复制实际源码并构建 release 二进制（依赖层已缓存）。
+#
+# 必须先 touch：cargo 按 mtime 判断新鲜度，而 COPY 进来的源文件保留原始 mtime，
+# 可能早于上一层 dummy 预编译产生的二进制，于是 cargo 认为「无需重编译」，
+# 直接把 `fn main() {}` 的空占位二进制打进运行镜像——容器起来立刻退出 0、
+# 零日志、不监听端口，且完全没有构建错误。这个陷阱曾真实发生过。
 COPY src/ src/
-RUN cargo build --release --locked
+RUN touch src/*.rs && cargo build --release --locked
 
 # 运行阶段：最小化镜像
 FROM debian:bookworm-slim
