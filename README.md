@@ -40,18 +40,24 @@ https://proxy.your-server.com/https://api.example.com/data?city=shanghai
 
 ### 预构建镜像（推荐，无需编译）
 
-CI 在打 SemVer tag 时构建 `linux/amd64` + `linux/arm64` 多架构镜像并推送到 GHCR：
+CI 在打 SemVer tag 时构建 `linux/amd64` + `linux/arm64` 多架构镜像，同时发布到 Docker Hub 与 GHCR（同一份产物）：
 
 ```bash
 docker run --rm -p 8080:8080 \
   -e ALLOW_TARGETS=api.github.com \
-  ghcr.io/kurisu994/any-proxy:0.1.0
+  kurisu003/any-proxy:0.1.0
+```
+
+备用镜像源（拉取困难时换用）：
+
+```bash
+docker pull ghcr.io/kurisu994/any-proxy:0.1.0
 ```
 
 版本请固定，不要用 `latest`——tag 可被覆盖，只有固定版本（或 digest）才能保证「重建即同一份产物」。要求更强时按 digest 固定：
 
 ```bash
-docker pull ghcr.io/kurisu994/any-proxy@sha256:<digest>
+docker pull kurisu003/any-proxy@sha256:<digest>
 ```
 
 每次发布的 digest 打印在对应 Actions 运行的 summary 里。
@@ -313,7 +319,9 @@ git tag v0.2.0 && git push origin main v0.2.0
 
 CI 会先校验 git tag 与 `Cargo.toml` 的 version 一致，不一致直接失败——否则会发布出「自称版本与 tag 不符」的镜像。两个架构各自在原生 runner 上构建后合成 manifest list，tag 规则为 `0.2.0` / `0.2` / `latest`（`0.x` 不生成 major tag，因为 0.x 不承诺兼容性）。
 
-> 首次发布后需在 GitHub 的 package 设置里把可见性改为 Public，否则匿名用户无法 `docker pull`。
+**前置配置**（只需一次）：仓库 Settings → Secrets and variables → Actions 添加 `DOCKERHUB_TOKEN`，值为 Docker Hub 的 Personal access token（Read & Write 权限，不是登录密码）。
+
+**首次发布后确认可见性**：Docker Hub 仓库按账户 Default privacy 自动创建，若为 Private 则服务器需先 `docker login`；GHCR 需在 GitHub → Packages 里改为 Public，否则匿名 `docker pull` 失败。
 
 ## 里程碑
 

@@ -41,8 +41,9 @@ services:
     # 想跑本地改动，先 `docker build -t any-proxy:dev .` 再：
     #   ANY_PROXY_IMAGE=any-proxy:dev docker compose -f docker-compose.caddy.yml up -d
     #
-    # 想按 digest 固定（防 tag 被覆盖），把值换成 ghcr.io/kurisu994/any-proxy@sha256:...
-    image: ${ANY_PROXY_IMAGE:-ghcr.io/kurisu994/any-proxy:0.1.0}
+    # 备用镜像源：ghcr.io/kurisu994/any-proxy:0.1.0（同一份产物，双 registry 发布）
+    # 想按 digest 固定（防 tag 被覆盖），把值换成 kurisu003/any-proxy@sha256:...
+    image: ${ANY_PROXY_IMAGE:-kurisu003/any-proxy:0.1.0}
     restart: unless-stopped
     # 不映射宿主端口：只在 compose 内部网络可达，公网入口只有 Caddy 一个
     expose:
