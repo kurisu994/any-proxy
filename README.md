@@ -97,25 +97,58 @@ curl http://localhost:8080/healthz
 
 ### 公网 HTTPS（Caddy 自动 TLS）
 
-仓库自带 `docker-compose.caddy.yml` + `Caddyfile`，一条命令起一个带证书的公网实例：
+> **浏览器场景下 HTTPS 不是可选项**：HTTPS 页面调用 `http://` 代理会被浏览器以 mixed content 拦掉，请求根本发不出去。any-proxy 自身只监听 HTTP，TLS 由前置反向代理终止。
+
+#### 方式一：`deploy.sh` 一键部署（推荐）
+
+服务器上无需 clone 仓库，脚本会在缺少配置时自动生成 `Caddyfile` 与 `docker-compose.caddy.yml`：
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/kurisu994/any-proxy/main/deploy.sh
+chmod +x deploy.sh
+./deploy.sh proxy.example.com
+```
+
+也可以把配置写进 `.env`（模板见 [.env.example](.env.example)），然后直接 `./deploy.sh`：
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/kurisu994/any-proxy/main/.env.example
+cp .env.example .env && vim .env     # 至少填 DOMAIN
+./deploy.sh
+```
+
+取值优先级：**位置参数 > shell 环境变量 > `.env` > 默认值**（与 docker compose 一致）。
+
+脚本在启动前会拦下几类最常见的签发失败原因：
+
+- 域名是 IP 地址（Let's Encrypt 不为 IP 签发证书）
+- 域名未解析到本机公网 IP（ACME HTTP-01 挑战会失败；`SKIP_DNS_CHECK=1` 可跳过）
+- 80/443 被 nginx 等进程占用（Caddy 需要独占）
+- 主镜像源拉不动时自动切换到 GHCR 备用源
+
+启动后会轮询等待证书签发，失败则打印 Caddy 日志与排查方向。脚本是幂等的，改配置后重跑即可。
+
+常用变量：`ALLOW_TARGETS`、`ALLOW_PORTS`、`AUTH_TOKEN`、`RATE_LIMIT_RPS`、`MAX_EGRESS_BYTES`、`ANY_PROXY_IMAGE`，完整列表见 `./deploy.sh --help`。
+
+#### 方式二：直接用 compose
 
 ```bash
 DOMAIN=proxy.example.com docker compose -f docker-compose.caddy.yml up -d
 ```
 
-前提：`DOMAIN` 的 A/AAAA 记录已指向本机公网 IP，且 80/443 可从公网访问（Caddy 走 ACME 挑战签发 Let's Encrypt 证书）。
+前提：`DOMAIN` 的 A/AAAA 记录已指向本机公网 IP，且 80/443 可从公网访问。
 
-这套编排与单机 `docker-compose.yml` 有四点不同，都是刻意的：
+#### 这套编排的取舍
 
 - **默认拉预构建镜像**（固定版本，非 `latest`），不在 VPS 上编译 Rust——小内存机器编译本项目容易直接 OOM。要跑本地改动：`docker build -t any-proxy:dev . && ANY_PROXY_IMAGE=any-proxy:dev docker compose -f docker-compose.caddy.yml up -d`。
 - **any-proxy 不映射宿主端口**，只在 compose 内部网络可达，公网入口只有 Caddy。
-- **默认带安全带**：`ALLOW_TARGETS=api.github.com`、`ALLOW_PORTS=80,443`、`RATE_LIMIT_RPS=10`、`MAX_EGRESS_BYTES=10GiB`。公网 HTTPS 降低了暴露门槛，所以默认必须收紧，放宽是显式选择：
+- **访问控制默认全关**：`ALLOW_TARGETS` / `ALLOW_PORTS` 留空即不限制，与 any-proxy 自身的配置语义一致。⚠️ 这意味着默认是**公网开放代理**——任何人拿到你的域名都能用它访问任意公网地址，带宽算你的。此时启动 gate 要求显式 `PUBLIC_MODE=1`，`deploy.sh` 会自动置位并醒目警告。按用途收紧才是最有效的手段：
 
   ```bash
-  DOMAIN=proxy.example.com ALLOW_TARGETS=.example.com,api.github.com \
-    docker compose -f docker-compose.caddy.yml up -d
+  ALLOW_TARGETS=api.github.com,.your-api.com ./deploy.sh proxy.example.com
   ```
 
+- **默认保留流量兜底**：`RATE_LIMIT_RPS=10`、`MAX_EGRESS_BYTES=10GiB`。它们不依赖调用方身份，是开放姿态下唯一的刹车。
 - **Caddy 关闭响应缓冲**（`flush_interval -1`）且不设上游响应超时，保持流式语义与「没有总时长上限」的约定。
 
 反向代理会把请求路径里的 `//` 折叠成 `/`，因此到达本服务的可能是 `/https:/api.github.com/zen`。这是被支持的形态（回归测试 `target::tests::test_collapsed_slashes_from_reverse_proxy` 锁定），无需额外重写规则。Caddy 注入的 `X-Forwarded-*` 也会被请求 header 清理通配删除，不会转发给上游。
