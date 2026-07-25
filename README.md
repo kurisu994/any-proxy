@@ -321,7 +321,7 @@ CI 会先校验 git tag 与 `Cargo.toml` 的 version 一致，不一致直接失
 |--------|------|------|
 | M0 | ✅ 完成 | 安全连接器 spike（URL 解析、地址策略、Connector、重定向） |
 | M1 | ✅ 完成 | 完整 Relay（Axum 接入、CORS、流式转发、Docker、优雅关闭）。存在已知偏差，见 [DESIGN.md 第 10 节](DESIGN.md#10-已知偏差汇总) |
-| M2 | 🚧 进行中 | 发布供应链。多架构镜像与容器冒烟已就位；SBOM、provenance、Prometheus 后置 |
+| M2 | ✅ 收敛 | 发布供应链。多架构预构建镜像与 CI 容器冒烟已就位；SBOM / provenance / Prometheus 按项目定位关闭，见 [TODOS.md](TODOS.md) |
 
 ## 设计文档
 
