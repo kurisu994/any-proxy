@@ -276,25 +276,91 @@ echo "==> 启动服务"
 export DOMAIN ALLOW_TARGETS ALLOW_PORTS RATE_LIMIT_RPS MAX_EGRESS_BYTES AUTH_TOKEN PUBLIC_MODE ANY_PROXY_IMAGE
 $COMPOSE -f docker-compose.caddy.yml up -d
 
-# ---- 等待 HTTPS 就绪 ----
-# 首次启动需要向 Let's Encrypt 申请证书，通常几秒到几十秒。
-echo "==> 等待证书签发与服务就绪（最多 120 秒）"
+# ---- 等待就绪 ----
+# 分三段，每段都能「早退」，不盲等：
+#   1) 容器状态：配置错误（如启动 gate 拒绝）会让容器直接退出，秒级即可发现
+#   2) 内部健康：不经过证书，验证 any-proxy 本身活着
+#   3) 证书 + HTTPS：边轮询边读 Caddy 日志，签发成功或失败都立刻知道
+compose_cid() { $COMPOSE -f docker-compose.caddy.yml ps -q "$1" 2>/dev/null || true; }
+caddy_logs()  { $COMPOSE -f docker-compose.caddy.yml logs --no-color --tail 200 caddy 2>/dev/null || true; }
+
+echo "==> 1/3 检查容器状态"
+for _ in $(seq 1 20); do
+  cid_ap="$(compose_cid any-proxy)"
+  cid_cd="$(compose_cid caddy)"
+  if [ -n "$cid_ap" ] && [ -n "$cid_cd" ]; then
+    st_ap="$(docker inspect -f '{{.State.Status}}' "$cid_ap" 2>/dev/null || echo unknown)"
+    st_cd="$(docker inspect -f '{{.State.Status}}' "$cid_cd" 2>/dev/null || echo unknown)"
+    # 容器退出说明是配置问题，继续等下去毫无意义
+    if [ "$st_ap" = "exited" ] || [ "$st_ap" = "dead" ]; then
+      red "✗ any-proxy 容器已退出"
+      echo
+      $COMPOSE -f docker-compose.caddy.yml logs --tail 30 any-proxy
+      echo
+      ylw "多半是配置问题：ALLOW_TARGETS/AUTH_TOKEN 皆空时需 PUBLIC_MODE=1；"
+      ylw "或 DENY_CIDRS 等配置值非法（any-proxy 对非法安全配置一律启动即失败）。"
+      exit 1
+    fi
+    [ "$st_ap" = "running" ] && [ "$st_cd" = "running" ] && break
+  fi
+  sleep 1
+done
+grn "  ✓ 容器运行中"
+
+echo "==> 2/3 检查 any-proxy 内部健康"
 ok=""
-for i in $(seq 1 60); do
-  code="$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 5 "https://$DOMAIN/healthz" 2>/dev/null || true)"
+for _ in $(seq 1 15); do
+  if $COMPOSE -f docker-compose.caddy.yml exec -T any-proxy any-proxy health-check >/dev/null 2>&1; then
+    ok=1; break
+  fi
+  sleep 1
+done
+if [ -z "$ok" ]; then
+  red "✗ any-proxy 未通过内部健康检查"
+  $COMPOSE -f docker-compose.caddy.yml logs --tail 30 any-proxy
+  exit 1
+fi
+grn "  ✓ any-proxy 就绪"
+
+# 证书签发正常时通常 3-15 秒完成。超过 60 秒基本可判定为 DNS 或防火墙问题，
+# 再等下去只是浪费时间——真正有价值的信号在 Caddy 日志里，所以边等边读。
+echo "==> 3/3 等待证书签发（正常 3-15 秒）"
+ok=""; acme_err=""
+for _ in $(seq 1 60); do
+  code="$(curl -fsS -o /dev/null -w '%{http_code}' --connect-timeout 3 --max-time 5 \
+          "https://${DOMAIN}/healthz" 2>/dev/null || true)"
   if [ "$code" = "200" ]; then ok=1; break; fi
-  printf '.'
-  sleep 2
+
+  logs="$(caddy_logs)"
+  # 证书到手但 HTTPS 还没通，多等一轮即可
+  if printf '%s' "$logs" | grep -q "certificate obtained successfully"; then
+    printf '+'
+  # ACME 明确失败：立即退出，不必等满
+  elif printf '%s' "$logs" | grep -qE "could not get certificate|no solvers succeeded|too many (certificates|failed authorizations)|urn:ietf:params:acme:error"; then
+    acme_err="$(printf '%s' "$logs" | grep -E "could not get certificate|no solvers succeeded|too many (certificates|failed authorizations)|urn:ietf:params:acme:error" | tail -3)"
+    break
+  else
+    printf '.'
+  fi
+  sleep 1
 done
 echo
 
 if [ -z "$ok" ]; then
-  red "✗ https://$DOMAIN/healthz 仍不可用"
+  red "✗ https://${DOMAIN}/healthz 仍不可用"
   echo
+  if [ -n "$acme_err" ]; then
+    red "Let's Encrypt 签发失败："
+    printf '%s\n' "$acme_err"
+    echo
+  fi
   ylw "常见原因："
   ylw "  1. 域名未指向本机公网 IP（ACME HTTP-01 挑战失败）"
-  ylw "  2. 云厂商安全组/防火墙未放行 80 与 443"
-  ylw "  3. Let's Encrypt 触发限流（同域名短时间内重复申请）"
+  ylw "  2. 云厂商安全组/防火墙未放行 80 与 443（容器端口通不代表安全组放行）"
+  ylw "  3. Let's Encrypt 触发限流（同域名短时间内重复申请，需等待数小时）"
+  echo
+  ylw "服务本身已在运行，修好上述问题后 Caddy 会自动重试，无需重跑脚本。"
+  ylw "实时观察：$COMPOSE -f docker-compose.caddy.yml logs -f caddy"
   echo
   echo "Caddy 最近日志："
   $COMPOSE -f docker-compose.caddy.yml logs --tail 30 caddy
