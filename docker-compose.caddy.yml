@@ -34,8 +34,15 @@ services:
       - any-proxy
 
   any-proxy:
-    build: .
-    image: any-proxy:latest
+    # 默认拉 GHCR 预构建多架构镜像（amd64/arm64），无需在 VPS 上编译 Rust
+    # ——小内存机器编译本项目容易直接 OOM。版本固定，不用 latest：tag 可被覆盖，
+    # 固定版本才能保证「重建即同一份产物」。
+    #
+    # 想跑本地改动，先 `docker build -t any-proxy:dev .` 再：
+    #   ANY_PROXY_IMAGE=any-proxy:dev docker compose -f docker-compose.caddy.yml up -d
+    #
+    # 想按 digest 固定（防 tag 被覆盖），把值换成 ghcr.io/kurisu994/any-proxy@sha256:...
+    image: ${ANY_PROXY_IMAGE:-ghcr.io/kurisu994/any-proxy:0.1.0}
     restart: unless-stopped
     # 不映射宿主端口：只在 compose 内部网络可达，公网入口只有 Caddy 一个
     expose:

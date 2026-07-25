@@ -1,0 +1,159 @@
+name: Release
+
+# 打 SemVer tag 时构建多架构镜像并推送到 GHCR。
+#
+# 发布流程：
+#   1. 改 Cargo.toml 的 version 并提交
+#   2. git tag v0.1.0 && git push origin v0.1.0
+#
+# 首次发布后需在 GitHub 包设置里把 package 可见性改为 Public，
+# 否则匿名用户无法 docker pull。
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # /healthz 回显 CARGO_PKG_VERSION。若 git tag 与 Cargo.toml 不一致，
+  # 发布出去的镜像会「自称的版本号与 tag 不符」，事后无法追溯。
+  verify-version:
+    name: 校验 tag 与 crate 版本一致
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 比对版本号
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          # ^version 精确匹配 [package] 的 version，不会命中 rust-version
+          crate=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "$tag" != "$crate" ]; then
+            echo "::error::git tag ($tag) 与 Cargo.toml version ($crate) 不一致"
+            exit 1
+          fi
+          echo "版本一致：$crate"
+
+  # 每个架构在原生 runner 上构建并按 digest 推送（不带 tag），
+  # 由 merge 作业合成 manifest list。相比 QEMU 交叉模拟，
+  # 原生 arm64 runner 让 Rust 编译时间从数十分钟降到与 amd64 相当。
+  build:
+    name: 构建 ${{ matrix.platform }}
+    needs: verify-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          # 公共仓库可免费使用原生 arm64 runner；若该 label 不可用，
+          # 可退回 ubuntu-latest + docker/setup-qemu-action（慢很多）
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 准备平台名（用作缓存与产物标识）
+        run: echo "PLATFORM_PAIR=${{ matrix.platform }}" | tr '/' '-' >> $GITHUB_ENV
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 构建并按 digest 推送
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          # provenance/SBOM 证明是后置项（见 TODOS 第 7 档），
+          # 且开启后会在 push-by-digest 模式下污染 manifest
+          provenance: false
+          cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
+          cache-to: type=gha,mode=max,scope=${{ env.PLATFORM_PAIR }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: 导出 digest
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${{ steps.build.outputs.digest }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests/*
+          retention-days: 1
+          if-no-files-found: error
+
+  merge:
+    name: 合成 manifest 并打 tag
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 生成镜像 tag
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # {{major}} 对 0.x 不生成（0.x 不承诺兼容性）；
+          # latest 由默认 flavor 在非 prerelease 的 semver tag 上自动追加
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: 合成 manifest list
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+
+      - name: 输出镜像 digest 供校验
+        run: |
+          ref="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}"
+          digest=$(docker buildx imagetools inspect "$ref" --format '{{.Manifest.Digest}}')
+          {
+            echo "## 镜像已发布"
+            echo
+            echo '```'
+            echo "docker pull $ref"
+            echo '```'
+            echo
+            echo "**按 digest 固定（推荐，防 tag 被覆盖）：**"
+            echo
+            echo '```'
+            echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@$digest"
+            echo '```'
+            echo
+            echo "包含架构："
+            echo '```'
+            docker buildx imagetools inspect "$ref" | grep -E 'Platform|Name:' || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

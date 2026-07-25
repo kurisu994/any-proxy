@@ -100,9 +100,9 @@
 - [x] **（P1）Dockerfile 的 Rust 版本低于 MSRV** — 上一批把真实 MSRV 从 1.75 修正为 1.86 时漏改 Dockerfile，构建镜像仍用 `rust:1.83-bookworm`，低于 `url`/`icu` 传递依赖要求，`docker build` 必然在依赖预编译阶段失败（且 CI 不构建镜像，无人拦截）。
   - 修复：`rust:1.83-bookworm` → `rust:1.86-bookworm`，并加注释说明必须 >= `Cargo.toml` 的 `rust-version`。文件：`Dockerfile`
   - 遗留：CI 仍不构建镜像，这类漂移下次仍无自动拦截——由「多架构镜像」项一并解决。
-- [ ] **D6（P2→提前）版本端点与预构建镜像** — ✅ 版本端点已做：`/healthz` 回显 `{"status":"ok","version":"…"}`（`src/error.rs`）。⏳ 预构建镜像 + SemVer tag + 固定版本 compose 待做（与「多架构镜像」合并处理）。
+- [x] **D6（P2→提前）版本端点与预构建镜像** — 版本端点 `/healthz` 回显 `{"status":"ok","version":"…"}`；预构建镜像 + SemVer tag + 固定版本 compose 已随「多架构镜像」一并完成（见第 7 档）。
   - ⚠️ Codex 建议提前：「目标用户不该先本地编译 Rust」，这是当前最大的分发摩擦之一。
-  - 文件：`src/error.rs`（已改）、`docker-compose.yml`、`.github/workflows/`
+  - 文件：`src/error.rs`、`docker-compose.caddy.yml`、`.github/workflows/release.yml`、`README.md`
 - [x] **N11（P3）容器加固** — compose 补 `read_only`、`cap_drop`、`no-new-privileges`、内存/pids 上限。对无额度开放代理，资源上限是唯一兜底。另：Dockerfile 依赖缓存层是坏的（只造 dummy `src/main.rs`，但 crate 还有 lib target，预构建必失败且被 `|| true` 吞掉，每次都全量重编）。
   - 修复：compose 补齐 4 项加固；Dockerfile 占位同时造 lib.rs+main.rs、去掉吞错误的 `|| true`、加 `--locked`。文件：`Dockerfile`、`docker-compose.yml`
 
@@ -122,9 +122,17 @@
   - 修复：删除三个零引用依赖，`hyper-util` 收窄为 `["tokio"]`；Dockerfile 两处 build 与 CI clippy/test/check 全部加 `--locked`。文件：`Cargo.toml`、`Cargo.lock`、`Dockerfile`、`.github/workflows/ci.yml`
 - [x] **E11（P3）CI 依赖安全检查** — `cargo deny` / `cargo audit`。
   - 修复：CI 新增 `audit` 作业（`rustsec/audit-check@v2`）。文件：`.github/workflows/ci.yml`
-- [ ] **（P2）多架构镜像** — Linux amd64 + arm64 由 CI 构建，附 SHA-256 校验文件。
-  - 文件：`.github/workflows/` · CC ~30min
-- [ ] **（P3）SBOM / provenance / 容器启动测试** — 后置。
+- [x] **（P2）多架构镜像** — Linux amd64 + arm64 由 CI 构建，附 SHA-256 校验。
+  - 实现（2026-07-25）：`.github/workflows/release.yml`，tag `v*` 触发。两个架构**各自在原生 runner 上构建**（amd64 用 `ubuntu-latest`，arm64 用公共仓库免费的 `ubuntu-24.04-arm`），按 digest 推送后合成 manifest list——避开 QEMU 模拟下 Rust 交叉编译数十分钟的代价。
+  - SemVer tag：`{{version}}` / `{{major}}.{{minor}}` / `latest`（`0.x` 不生成 major tag）。SHA-256 以镜像 digest 形式输出到 Actions summary，README 说明如何按 digest 固定。
+  - 发布前置校验：git tag 与 `Cargo.toml` version 必须一致（`/healthz` 回显的就是后者），否则作业失败——防止发出「自称版本与 tag 不符」的镜像。
+  - 固定版本 compose：`docker-compose.caddy.yml` 改为默认拉 `ghcr.io/kurisu994/any-proxy:0.1.0`，可用 `ANY_PROXY_IMAGE` 覆盖为本地镜像或 digest。
+  - ⏳ **待你操作**：镜像需先打第一个 tag（`v0.1.0`）才存在；发布后还要在 GitHub package 设置里把可见性改为 Public，否则匿名 `docker pull` 失败。在此之前 caddy 编排需用 `ANY_PROXY_IMAGE=any-proxy:dev` 配合本地构建。
+- [x] **（P2）CI 镜像构建与容器冒烟** — 此前 CI 完全不碰 Dockerfile，导致 MSRV 1.75→1.86 修正时漏改构建镜像版本、`docker build` 静默坏掉无人拦截（本轮才发现）。
+  - 实现：`ci.yml` 新增 `docker` 作业——构建镜像 → 断言启动 gate 拒绝「无防护 + 非 loopback 监听」 → 带 `ALLOW_TARGETS` 启动后校验 `/healthz` 状态与版本号 → 校验 `health-check` 子命令（compose healthcheck 依赖它）。
+  - 顺带覆盖了原第 7 档 P3「容器启动测试」的主体。
+- [ ] **（P3）SBOM / provenance** — 后置。容器启动测试已由上面的 CI `docker` 作业覆盖。
+  - 注：`release.yml` 目前显式 `provenance: false`（开启会在 push-by-digest 模式下污染 manifest）。要做时需连带处理 attestation 与 manifest list 的合成方式。
 - [ ] **（P3）Prometheus exporter** — 后置。Codex：「在尚无用户验证时把 M2 定义成 SBOM/provenance/Prometheus，是供应链成熟度领先于产品成熟度」。
 
 ## 第 8 档 — 分发形态（最后）

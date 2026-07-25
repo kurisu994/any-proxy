@@ -63,3 +63,48 @@ jobs:
         uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  # 构建镜像并真正跑起来。此前 CI 完全不碰 Dockerfile，导致 MSRV 从 1.75
+  # 修正到 1.86 时漏改构建镜像版本，`docker build` 静默坏掉无人发现。
+  docker:
+    name: 镜像构建与容器冒烟
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 构建镜像
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: any-proxy:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 启动 gate 应拒绝「无防护 + 非 loopback 监听」
+        run: |
+          if docker run --rm -e LISTEN_ADDR=0.0.0.0:8080 any-proxy:ci; then
+            echo "::error::启动 gate 失效：无防护的 0.0.0.0 监听竟然启动成功"
+            exit 1
+          fi
+          echo "启动 gate 按预期拒绝启动"
+
+      - name: 配置安全带后应正常服务
+        run: |
+          docker run -d --name smoke -p 8080:8080 \
+            -e LISTEN_ADDR=0.0.0.0:8080 -e ALLOW_TARGETS=api.github.com \
+            any-proxy:ci
+          for _ in $(seq 1 20); do
+            curl -fsS http://127.0.0.1:8080/healthz -o /tmp/healthz.json && break
+            sleep 1
+          done
+          cat /tmp/healthz.json
+          grep -q '"status":"ok"' /tmp/healthz.json
+          # 回显版本须与 Cargo.toml 一致，否则镜像版本无法追溯
+          crate=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          grep -q "\"version\":\"$crate\"" /tmp/healthz.json
+          # 容器内置的 health-check 子命令（compose healthcheck 依赖它）
+          docker exec smoke any-proxy health-check
+          docker rm -f smoke

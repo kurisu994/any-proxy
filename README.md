@@ -38,6 +38,26 @@ https://proxy.your-server.com/https://api.example.com/data?city=shanghai
 
 ## 快速开始
 
+### 预构建镜像（推荐，无需编译）
+
+CI 在打 SemVer tag 时构建 `linux/amd64` + `linux/arm64` 多架构镜像并推送到 GHCR：
+
+```bash
+docker run --rm -p 8080:8080 \
+  -e ALLOW_TARGETS=api.github.com \
+  ghcr.io/kurisu994/any-proxy:0.1.0
+```
+
+版本请固定，不要用 `latest`——tag 可被覆盖，只有固定版本（或 digest）才能保证「重建即同一份产物」。要求更强时按 digest 固定：
+
+```bash
+docker pull ghcr.io/kurisu994/any-proxy@sha256:<digest>
+```
+
+每次发布的 digest 打印在对应 Actions 运行的 summary 里。
+
+> 上面示例带了 `ALLOW_TARGETS`：监听非 loopback 地址且零防护时进程会拒绝启动，详见[安全带](#安全带可选默认全关)。
+
 ### 从源码构建
 
 ```bash
@@ -79,8 +99,9 @@ DOMAIN=proxy.example.com docker compose -f docker-compose.caddy.yml up -d
 
 前提：`DOMAIN` 的 A/AAAA 记录已指向本机公网 IP，且 80/443 可从公网访问（Caddy 走 ACME 挑战签发 Let's Encrypt 证书）。
 
-这套编排与单机 `docker-compose.yml` 有三点不同，都是刻意的：
+这套编排与单机 `docker-compose.yml` 有四点不同，都是刻意的：
 
+- **默认拉预构建镜像**（固定版本，非 `latest`），不在 VPS 上编译 Rust——小内存机器编译本项目容易直接 OOM。要跑本地改动：`docker build -t any-proxy:dev . && ANY_PROXY_IMAGE=any-proxy:dev docker compose -f docker-compose.caddy.yml up -d`。
 - **any-proxy 不映射宿主端口**，只在 compose 内部网络可达，公网入口只有 Caddy。
 - **默认带安全带**：`ALLOW_TARGETS=api.github.com`、`ALLOW_PORTS=80,443`、`RATE_LIMIT_RPS=10`、`MAX_EGRESS_BYTES=10GiB`。公网 HTTPS 降低了暴露门槛，所以默认必须收紧，放宽是显式选择：
 
@@ -278,13 +299,29 @@ cargo test --test concurrency       # 并发上限与流生命周期回归
 cargo test --test concurrency -- --ignored   # 35 秒长传输回归，默认跳过
 ```
 
+### 发布
+
+镜像由 tag 触发发布，流程固定为三步：
+
+```bash
+# 1. 改 Cargo.toml 的 version（/healthz 回显的就是它）
+# 2. 提交
+git commit -am "release: v0.2.0"
+# 3. 打 tag 推送，CI 自动构建多架构镜像并推 GHCR
+git tag v0.2.0 && git push origin main v0.2.0
+```
+
+CI 会先校验 git tag 与 `Cargo.toml` 的 version 一致，不一致直接失败——否则会发布出「自称版本与 tag 不符」的镜像。两个架构各自在原生 runner 上构建后合成 manifest list，tag 规则为 `0.2.0` / `0.2` / `latest`（`0.x` 不生成 major tag，因为 0.x 不承诺兼容性）。
+
+> 首次发布后需在 GitHub 的 package 设置里把可见性改为 Public，否则匿名用户无法 `docker pull`。
+
 ## 里程碑
 
 | 里程碑 | 状态 | 说明 |
 |--------|------|------|
 | M0 | ✅ 完成 | 安全连接器 spike（URL 解析、地址策略、Connector、重定向） |
 | M1 | ✅ 完成 | 完整 Relay（Axum 接入、CORS、流式转发、Docker、优雅关闭）。存在已知偏差，见 [DESIGN.md 第 10 节](DESIGN.md#10-已知偏差汇总) |
-| M2 | 待做 | 发布供应链（多架构镜像、SBOM、provenance、Prometheus） |
+| M2 | 🚧 进行中 | 发布供应链。多架构镜像与容器冒烟已就位；SBOM、provenance、Prometheus 后置 |
 
 ## 设计文档
 
