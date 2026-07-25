@@ -51,10 +51,15 @@ services:
     environment:
       - LISTEN_ADDR=0.0.0.0:8080
       - RUST_LOG=info
-      # 安全带：默认只放行一个目标域名。改成你真正要代理的目标（逗号分隔，
-      # `.example.com` 形式匹配子域）。放宽即意味着你为该目标的带宽与滥用负责。
-      - ALLOW_TARGETS=${ALLOW_TARGETS:-api.github.com}
-      - ALLOW_PORTS=${ALLOW_PORTS:-80,443}
+      # 安全带：留空 = 不限制，与 any-proxy 自身的配置语义一致。
+      # ⚠️ 全部留空即为【公网开放代理】——任何人都能用它访问任意公网地址，
+      #    带宽算你的。按实际用途收紧才是最有效的手段，例如：
+      #      ALLOW_TARGETS=api.github.com,.your-api.com
+      - ALLOW_TARGETS=${ALLOW_TARGETS:-}
+      - ALLOW_PORTS=${ALLOW_PORTS:-}
+      - AUTH_TOKEN=${AUTH_TOKEN:-}
+      # 无 ALLOW_TARGETS 也无 AUTH_TOKEN 时，启动 gate 要求显式确认才放行启动
+      - PUBLIC_MODE=${PUBLIC_MODE:-1}
       # 带宽账单兜底：全局令牌桶限速 + 进程累计出口字节上限（重启重置）
       - RATE_LIMIT_RPS=${RATE_LIMIT_RPS:-10}
       - MAX_EGRESS_BYTES=${MAX_EGRESS_BYTES:-10737418240} # 10 GiB
