@@ -103,8 +103,11 @@ jobs:
 
       - name: 导出 digest
         run: |
+          # 必须剥掉 `sha256:` 前缀再做文件名：upload-artifact 不接受含冒号的路径。
+          # merge 阶段用 `<image>@sha256:<文件名>` 拼回完整引用。
+          digest="${{ steps.build.outputs.digest }}"
           mkdir -p /tmp/digests
-          touch "/tmp/digests/${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
 
       - uses: actions/upload-artifact@v4
         with:
