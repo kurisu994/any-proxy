@@ -213,7 +213,7 @@ deny 列表覆盖：私网、链路本地（含云元数据 `169.254.169.254`）
 
 | 领域 | 偏差 | 条目 |
 |------|------|------|
-| 库边界 | 测试逃生口是公开 API（仅影响 library 复用，二进制走可信路径） | E2 / E6 |
+| 库边界 | 测试逃生口是公开 API（仅影响 library 复用，二进制走可信路径） | E2 / E6——2026-07-25 按「自用/实验」定位**关闭**，重开条件见 TODOS |
 
 > 2026-07-24 一批安全边界与代理正确性偏差（M2 / M3 / N2 / N3 / N4 / N5 / N7 / E7 / E8 / E9 / N6 / N12 / N13 / N14 / N15 及 E5 的假承诺）已修复，不再列此表。
 
@@ -240,13 +240,19 @@ cargo test --test concurrency -- --ignored   # 35 秒长传输回归，默认跳
 
 测试使用本地确定性 fixture 与注入式假 `Resolver`/`Dialer`，不依赖公网 DNS 或第三方服务。安全修复至少覆盖成功路径、拒绝路径和「未发生 dial」断言。
 
-> ⚠️ 已知覆盖缺口见 TODOS 第 7 档：核心编排模块无单测、4 个 method 无端到端测试、
-> 无端到端重定向测试、fixture 假上游不解析请求。
+`tests/streaming_memory.rs` 是独立 test binary：它安装 `#[global_allocator]` 统计峰值堆占用，
+与其他测试并行会被对方的分配污染计数。
 
 ## 14. 里程碑标准的验证状态
 
-原始 M0/M1/M2 成功标准见归档文档。M1 的以下标准当前**宣称完成但未被测试验证**：
+原始 M0/M1/M2 成功标准见归档文档。2026-07-25 起，此前「宣称完成但未被测试验证」的三条已全部落地验证：
 
-- 「GET/HEAD/POST/PUT/PATCH/DELETE 六个 method 转发」— 只有 GET/HEAD 有端到端测试
-- 「256 MiB 流式传输常驻内存不线性增长」— 测试只数字节数，从不测内存
-- 「无 trailers 有集成测试」— 该测试不存在，且实现本身就转发 trailer（见 M2）
+| M1 标准 | 验证方式 |
+|---------|----------|
+| GET/HEAD/POST/PUT/PATCH/DELETE 六个 method 转发 | `relay.rs::test_methods_with_body_forwarded`，用录制式假上游断言 method/path/body 与 Host 重建 |
+| 256 MiB 流式传输常驻内存不线性增长 | `tests/streaming_memory.rs` 用全局分配器断言峰值堆增量 < 32 MiB；已负向验证（改成缓冲后峰值 724 MiB 并正确失败） |
+| 无 trailers 有集成测试 | 实现改为丢弃 trailer frame，覆盖于 `body_timeout::test_trailer_frame_dropped` |
+
+核心编排模块 `src/proxy.rs` 另有 9 个单测，主线是**「被拒请求不得触网」**——
+401/403/429/405/URI 超长五条路径均断言 `resolve` 与 `dial` 调用次数为 0。
+这是安全属性：若拒绝发生在解析/连接之后，未授权调用方即可拿代理当 DNS 预言机与端口探测器。
