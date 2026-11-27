@@ -26,8 +26,9 @@ use http_body::Body as HttpBody;
 /// 同时累计透传的 data 字节数，用于遥测契约（DESIGN §9，N13）：
 /// 流正常结束记 `stream complete`，中止时 `log_stream_aborted` 带真实
 /// `request_id` 与字节数，替代过去硬编码的 `("unknown", 0)`。
-pub struct IdleTimeoutBody<B> {
-    inner: B,
+pub struct IdleTimeoutBody<B: HttpBody> {
+    /// 用 Option 包装以便在归还连接池前先释放底层 `Incoming`，让 Hyper 客户端状态机立刻回到 idle
+    inner: Option<B>,
     timeout: Duration,
     /// 定时器：到期后唤醒 poll_frame 检查超时
     sleep: Option<Pin<Box<tokio::time::Sleep>>>,
@@ -41,9 +42,14 @@ pub struct IdleTimeoutBody<B> {
     finished: bool,
     /// 全局出口预算（配置后逐 frame 累加出口字节）
     budget: Option<std::sync::Arc<crate::budget::Budget>>,
+    /// 流正常结束（`Poll::Ready(None)` 或 `inner.is_end_stream()` 为真）时触发的一次性回调
+    ///
+    /// 供上游连接池安全归还空闲连接：超时、frame 出错或客户端提前断开时永不触发，
+    /// 连接直接随回调 Drop 关闭，避免未读完的脏流污染后续请求。
+    on_complete: Option<Box<dyn FnOnce() + Send>>,
 }
 
-impl<B> IdleTimeoutBody<B> {
+impl<B: HttpBody> IdleTimeoutBody<B> {
     /// 创建 idle timeout body（不带遥测上下文与预算，主要供测试使用）
     pub fn new(inner: B, timeout: Duration) -> Self {
         Self::with_context(inner, timeout, Arc::from("-"), "stream", None)
@@ -61,7 +67,7 @@ impl<B> IdleTimeoutBody<B> {
         budget: Option<std::sync::Arc<crate::budget::Budget>>,
     ) -> Self {
         Self {
-            inner,
+            inner: Some(inner),
             timeout,
             sleep: None,
             request_id,
@@ -69,7 +75,17 @@ impl<B> IdleTimeoutBody<B> {
             bytes: 0,
             finished: false,
             budget,
+            on_complete: None,
         }
+    }
+
+    /// 注册流正常结束时的回调
+    pub fn with_on_complete<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.on_complete = Some(Box::new(f));
+        self
     }
 
     /// 启动或重置定时器
@@ -77,10 +93,42 @@ impl<B> IdleTimeoutBody<B> {
         self.sleep = Some(Box::pin(tokio::time::sleep(self.timeout)));
     }
 
+    /// 标记流正常完成：先释放底层 Body，再记日志并触发完成回调
+    fn finish_complete(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        // 先 drop 底层 `hyper::body::Incoming`，确保 Hyper HTTP/1.1 连接状态机
+        // 在 `on_complete` 将 `SendRequest` 放回连接池前释放响应体占用。
+        self.inner = None;
+        tracing::debug!(
+            request_id = %self.request_id,
+            direction = self.direction,
+            bytes = self.bytes,
+            "stream complete"
+        );
+        if let Some(cb) = self.on_complete.take() {
+            cb();
+        }
+    }
+
     /// 已透传的 data 字节数（测试用）
     #[cfg(test)]
     pub(crate) fn bytes_for_test(&self) -> u64 {
         self.bytes
+    }
+}
+
+impl<B: HttpBody> Drop for IdleTimeoutBody<B> {
+    fn drop(&mut self) {
+        // Hyper HTTP/1.1 服务端写出带精确 `Content-Length` 或空 Body（如 HEAD / 204）
+        // 的响应后，可能不再多调一次 `poll_frame()` 就直接 Drop Body。
+        // 此时若底层 `inner.is_end_stream()` 已为 true，说明上游响应体确已完整消费，
+        // 应正常触发完成日志与连接池归还；若尚未读完（客户端中途断开）则绝不触发。
+        if !self.finished && self.inner.as_ref().is_some_and(HttpBody::is_end_stream) {
+            self.finish_complete();
+        }
     }
 }
 
@@ -129,7 +177,10 @@ where
             }
 
             // 2. 轮询内部 body
-            match Pin::new(&mut this.inner).poll_frame(cx) {
+            let Some(inner) = this.inner.as_mut() else {
+                return Poll::Ready(None);
+            };
+            match Pin::new(inner).poll_frame(cx) {
                 Poll::Ready(Some(Ok(frame))) => {
                     // 有活动，重置定时器
                     this.reset_sleep();
@@ -139,6 +190,11 @@ where
                         this.bytes += n;
                         if let Some(b) = &this.budget {
                             b.add_egress(n);
+                        }
+                        // 定长响应读完最后一帧后 `is_end_stream()` 会立刻变为 true，
+                        // 提前完成清理并归还连接池，避免依赖调用方额外再 poll 一次 None。
+                        if this.inner.as_ref().is_some_and(HttpBody::is_end_stream) {
+                            this.finish_complete();
                         }
                         return Poll::Ready(Some(Ok(frame)));
                     }
@@ -163,16 +219,7 @@ where
                     return Poll::Ready(Some(Err(std::io::Error::other("body frame error"))));
                 }
                 Poll::Ready(None) => {
-                    // 流正常结束：记完成日志，补全 DESIGN §9 契约的字节计数（N13）
-                    if !this.finished {
-                        this.finished = true;
-                        tracing::debug!(
-                            request_id = %this.request_id,
-                            direction = this.direction,
-                            bytes = this.bytes,
-                            "stream complete"
-                        );
-                    }
+                    this.finish_complete();
                     return Poll::Ready(None);
                 }
                 Poll::Pending => {
@@ -182,6 +229,16 @@ where
                 }
             }
         }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.as_ref().is_none_or(HttpBody::is_end_stream)
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner
+            .as_ref()
+            .map_or_else(http_body::SizeHint::default, HttpBody::size_hint)
     }
 }
 
@@ -194,9 +251,21 @@ pub fn wrap_response_body(
     request_id: Arc<str>,
     budget: Arc<crate::budget::Budget>,
 ) -> axum::body::Body {
+    wrap_response_body_with_on_complete(body, timeout, request_id, budget, None)
+}
+
+/// 将 idle timeout 应用于上游响应 body，并附带正常 EOF 完成回调（用于连接池归还）
+pub fn wrap_response_body_with_on_complete(
+    body: hyper::body::Incoming,
+    timeout: Duration,
+    request_id: Arc<str>,
+    budget: Arc<crate::budget::Budget>,
+    on_complete: Option<Box<dyn FnOnce() + Send>>,
+) -> axum::body::Body {
     use http_body_util::BodyExt;
-    let wrapped =
+    let mut wrapped =
         IdleTimeoutBody::with_context(body, timeout, request_id, "download", Some(budget));
+    wrapped.on_complete = on_complete;
     axum::body::Body::new(wrapped.map_err(axum::Error::new))
 }
 
@@ -297,5 +366,33 @@ mod tests {
             frame.unwrap();
         }
         assert_eq!(body.bytes_for_test(), 11);
+    }
+
+    /// 正常读到 EOF 触发 on_complete；中途 drop 不触发，防止脏连接归还连接池
+    #[tokio::test]
+    async fn test_on_complete_only_on_eof() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let fired = Arc::new(AtomicBool::new(false));
+        let fired_clone = fired.clone();
+        let body = IdleTimeoutBody::new(axum::body::Body::from("ok"), Duration::from_secs(30))
+            .with_on_complete(move || {
+                fired_clone.store(true, Ordering::SeqCst);
+            });
+        let _ = body.collect().await.unwrap();
+        assert!(fired.load(Ordering::SeqCst), "读到 EOF 后必须触发回调");
+
+        // 未读完直接 Drop，绝不能触发 on_complete
+        let fired2 = Arc::new(AtomicBool::new(false));
+        let fired2_clone = fired2.clone();
+        let body2 = IdleTimeoutBody::new(axum::body::Body::from("unread"), Duration::from_secs(30))
+            .with_on_complete(move || {
+                fired2_clone.store(true, Ordering::SeqCst);
+            });
+        drop(body2);
+        assert!(
+            !fired2.load(Ordering::SeqCst),
+            "流未读完即被 Drop 时不得触发完成回调"
+        );
     }
 }

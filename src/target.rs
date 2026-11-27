@@ -30,20 +30,27 @@ pub struct Target {
 pub enum Scheme {
     Http,
     Https,
+    Ws,
+    Wss,
 }
 
 impl Scheme {
     /// 默认端口
     pub fn default_port(self) -> u16 {
         match self {
-            Self::Http => 80,
-            Self::Https => 443,
+            Self::Http | Self::Ws => 80,
+            Self::Https | Self::Wss => 443,
         }
     }
 
-    /// 是否为 TLS
+    /// 是否为 TLS（HTTPS 或 WSS）
     pub fn is_tls(self) -> bool {
-        matches!(self, Self::Https)
+        matches!(self, Self::Https | Self::Wss)
+    }
+
+    /// 是否为 WebSocket 协议（WS 或 WSS）
+    pub fn is_ws(self) -> bool {
+        matches!(self, Self::Ws | Self::Wss)
     }
 }
 
@@ -52,6 +59,8 @@ impl std::fmt::Display for Scheme {
         match self {
             Self::Http => write!(f, "http"),
             Self::Https => write!(f, "https"),
+            Self::Ws => write!(f, "ws"),
+            Self::Wss => write!(f, "wss"),
         }
     }
 }
@@ -119,10 +128,12 @@ pub fn parse_target(raw_path_and_query: &str) -> Result<Target, crate::ProxyErro
         message: format!("URL 解析失败: {e}"),
     })?;
 
-    // 只允许 http 与 https
+    // 只允许 http / https / ws / wss
     let scheme = match parsed.scheme() {
         "http" => Scheme::Http,
         "https" => Scheme::Https,
+        "ws" => Scheme::Ws,
+        "wss" => Scheme::Wss,
         other => {
             return Err(crate::ProxyError::InvalidTarget {
                 message: format!("不允许的协议: {other}"),
@@ -324,7 +335,29 @@ mod tests {
     #[test]
     fn test_reject_non_http_scheme() {
         assert!(parse_target("/ftp://example.com/").is_err());
-        assert!(parse_target("/ws://example.com/").is_err());
+        assert!(parse_target("/file:///etc/passwd").is_err());
+        assert!(parse_target("/javascript:alert(1)").is_err());
+    }
+
+    #[test]
+    fn test_parse_ws_and_wss_scheme() {
+        let ws = parse_target("/ws://api.example.com/v1/realtime?model=gpt").unwrap();
+        assert_eq!(ws.scheme, Scheme::Ws);
+        assert_eq!(ws.port, 80);
+        assert!(!ws.scheme.is_tls());
+        assert!(ws.scheme.is_ws());
+        assert_eq!(ws.request_target(), "/v1/realtime?model=gpt");
+
+        let wss = parse_target("/wss://api.openai.com/v1/realtime").unwrap();
+        assert_eq!(wss.scheme, Scheme::Wss);
+        assert_eq!(wss.port, 443);
+        assert!(wss.scheme.is_tls());
+        assert!(wss.scheme.is_ws());
+
+        // 反向代理折叠斜杠后的 wss:/ 同样可正常解析
+        let collapsed = parse_target("/wss:/api.openai.com/v1/realtime").unwrap();
+        assert_eq!(collapsed.scheme, Scheme::Wss);
+        assert_eq!(collapsed.authority(), "api.openai.com");
     }
 
     /// 反向代理（如 Caddy）会对请求路径做规范化，把 `//` 折叠成 `/`，

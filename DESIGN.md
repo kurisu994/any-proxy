@@ -22,7 +22,7 @@ https://proxy.example.com/https://api.example.com/data?city=shanghai
 
 请求从部署服务器的网络出口发出，浏览器可以读取返回的 CORS 响应。
 
-**不做**：TCP/UDP/SOCKS、HTTP CONNECT、整机代理、WebSocket、协议升级、内容改写、自动解压。
+**不做**：TCP/UDP/SOCKS、HTTP CONNECT、整机代理、非 WebSocket 协议升级（如 h2c）、gRPC、内容改写、自动解压。
 
 **部署形态**：单个 Rust 二进制 + 单容器。服务内部只监听 HTTP，公网 HTTPS 由部署者的反向代理终止。
 
@@ -74,8 +74,10 @@ https://proxy.example.com/https://api.example.com/data?city=shanghai
 |------|------|
 | `main.rs` | 进程入口、配置加载、启动 gate、宿主接口刷新调度、`health-check` 子命令、SIGTERM 关闭 |
 | `app.rs` | Axum Router 组装 |
-| `concurrency.rs` | 进程级并发上限，permit 生命周期绑定到响应流结束 |
+| `concurrency.rs` | 进程级并发上限，permit 生命周期绑定到响应流或 WebSocket 会话结束 |
 | `budget.rs` | 全局出口字节预算与令牌桶限速（C1 批次 2） |
+| `pool.rs` | 安全的 HTTP/1.1 Keep-Alive 上游连接池（按 origin 隔离、取出复核 AddressPolicy、仅 EOF 归还） |
+| `ws.rs` | 基于 Hyper 原生 HTTP/1.1 Upgrade 的 WebSocket 透明升级与全双工转发 |
 | `proxy.rs` | 核心编排 |
 | `config.rs` | 环境变量解析与校验 |
 | `headers.rs` | 请求/响应 header 清理、CORS 预检与响应头 |
@@ -91,15 +93,16 @@ https://proxy.example.com/https://api.example.com/data?city=shanghai
 
 这是本项目唯一不可退让的部分。以下每条都有对应测试。
 
-- 只允许规范化后的 HTTP/HTTPS 目标；拒绝 userinfo、非法端口。
+- 只允许规范化后的 HTTP/HTTPS/WS/WSS 目标；拒绝 userinfo、非法端口；普通 HTTP 请求指向 `ws`/`wss` 或禁用 `ALLOW_WEBSOCKET` 时在触网前拒绝。
 - **DNS 解析、全部 A/AAAA 地址校验、地址选择与实际 TCP dial 绑定在同一个 `Connector` 调用内。** 禁止先校验 hostname、再由其他客户端重新解析（DNS rebinding 防护）。
 - **DNS 答案只要混入一个非公网地址就整体拒绝**，不挑选其中的公网地址继续。
 - 实际 `peer_addr` 必须属于本次已验证的地址集合。
 - 任何策略失败都在建立上游连接前返回错误（**零次 dial**）。
-- 每次重定向重新解析并校验；拒绝重定向环、超限跳转和 HTTPS 降级到 HTTP。
+- 每次重定向重新解析并校验；拒绝重定向环、超限跳转和 TLS 降级到明文（HTTPS/WSS 降级到 HTTP/WS）。
 - TLS 证书校验和 SNI 使用原始规范化 hostname，TCP 使用已固定的 IP；生产代码不接受任意证书。系统根证书加载为空时进程直接退出，不「假活着」。
 - 不读取 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`。
-- 上游连接**不复用**：每次请求都走一次完整的 resolve → 全量校验 → 固定 IP → dial。
+- **安全 HTTP/1.1 连接复用**：新建连接始终走完整 `Connector` 流水线；连接池严格按 `(is_tls, canonical_host, port)` 隔离，取出时复核 `AddressPolicy::is_allowed(&peer_addr)` 并强制淘汰超过 `POOL_IDLE_TIMEOUT` 或 `POOL_MAX_LIFETIME` 的条目，且仅在响应流完整 EOF 后归还（客户端断开、超时、错误、重定向中继与 WebSocket 连接绝不入池；`POOL_MAX_IDLE_PER_HOST=0` 可一键关闭）。
+- **WebSocket 升级白名单**：仅放行 RFC 6455 `GET` + `Upgrade: websocket`（拒绝 `h2c` 等其他升级协议），复用全部前置访问控制与 `Connector` 校验，且并发 permit 经 `PermitSlot` 绑定到后台双向转发任务直到会话关闭。
 
 ### 地址策略的真实形态
 
@@ -137,7 +140,8 @@ deny 列表覆盖：私网、链路本地（含云元数据 `169.254.169.254`）
 
 | 路径 | 方法 | 行为 |
 |------|------|------|
-| `/<absolute-http-or-https-url>` | GET/HEAD/POST/PUT/PATCH/DELETE | 代理转发 |
+| `/<absolute-http-or-https-url>` | GET/HEAD/POST/PUT/PATCH/DELETE | 代理转发（支持安全 Keep-Alive 连接复用） |
+| `/<ws-or-wss-or-http-url>` | GET + `Upgrade: websocket` | WebSocket 透明升级转发（`ALLOW_WEBSOCKET` 控制） |
 | `/<absolute-http-or-https-url>` | OPTIONS | CORS 预检，固定 204 |
 | `/healthz` | GET | 存活检查，不占用并发配额 |
 | `/` | GET | 用法说明与风险提示 |
@@ -162,8 +166,8 @@ deny 列表覆盖：私网、链路本地（含云元数据 `169.254.169.254`）
 - 请求与响应 Body 都逐帧转发，不完整缓冲。不做内容自动解压。
 - 客户端断开后取消上游工作。
 - **没有总请求时长上限。** 只要数据在流动，多长的传输都不会被代理主动中断。
-- 卡死由**逐 frame 空闲超时**兜底：上传 `UPLOAD_IDLE_TIMEOUT`，下载 `UPSTREAM_BODY_IDLE_TIMEOUT`。
-- **并发配额覆盖整个响应流的生命周期**（permit 挂在响应 Body 上，流结束才释放），因此 `MAX_CONCURRENT_REQUESTS` 是进程 socket 与上游连接任务的真实上界。
+- 卡死由**逐 frame 空闲超时**兜底：上传 `UPLOAD_IDLE_TIMEOUT`，下载 `UPSTREAM_BODY_IDLE_TIMEOUT`（默认 180s），WebSocket 双向空闲 `WS_IDLE_TIMEOUT`（默认 300s）。
+- **并发配额覆盖整个响应流与 WebSocket 会话的生命周期**（HTTP permit 挂在响应 Body 上、WS permit 经 `PermitSlot` 移交双向转发任务，结束才释放），因此 `MAX_CONCURRENT_REQUESTS` 是进程 socket 与上游连接任务的真实上界。
 - 达到上限时**立即返回 `503 service_overloaded`**，不排队：调用方需要知道「过载」而不是看到「卡死」。
 - HTTP/1 解析层的 buffer 与 header 数量上限使用 hyper 默认值，不额外暴露配置。
 - 失败连接按解析出的地址顺序 failover，直到成功或耗尽全部候选地址。

@@ -26,10 +26,10 @@
 
 ## 能力范围
 
-- **支持**：公网 HTTP/HTTPS 目标的 `GET`、`HEAD`、`POST`、`PUT`、`PATCH`、`DELETE` 流式转发；`OPTIONS` 预检（固定 204）；`/healthz` 存活与版本探活；`/` 用法与风险说明首页。
-- **不做**：TCP/UDP/SOCKS、HTTP `CONNECT`/`TRACE`、WebSocket 与协议升级、整机代理、内容改写、自动解压、管理 UI、账户系统、按调用方配额、官方公共实例。
+- **支持**：公网 HTTP/HTTPS 目标的 `GET`、`HEAD`、`POST`、`PUT`、`PATCH`、`DELETE` 流式转发；`ws://`/`wss://` WebSocket 透明升级转发（适配 OpenAI Realtime / Gemini Live 等实时接口）；`OPTIONS` 预检（固定 204）；`/healthz` 存活与版本探活；`/` 用法与风险说明首页。
+- **不做**：TCP/UDP/SOCKS、HTTP `CONNECT`/`TRACE`、非 WebSocket 协议升级（如 h2c）、gRPC、整机代理、内容改写、自动解压、管理 UI、账户系统、按调用方配额、官方公共实例。
 - **默认姿态与安全带**：核心保持零配置匿名可用，默认允许公共端口 `1..=65535`；但新增**启动 gate**（非 loopback 监听且未配置任何防护、也未设 `PUBLIC_MODE=1` 时拒绝启动）。提供可选、默认关、可组合的 C1 安全带（`ALLOW_TARGETS`、`ALLOW_PORTS`、`ALLOW_ORIGINS`、`AUTH_TOKEN`）及不依赖调用方身份的全局兜底（`RATE_LIMIT_RPS`、`MAX_EGRESS_BYTES`）。
-- **部署与连接形态**：服务内部只监听 HTTP，公网 HTTPS 由前置反向代理（如 Caddy）终止；可通过 `cargo run`、Docker 或 `deploy.sh` 运行，以 `curl` 或浏览器调用。上游连接**不复用**（无连接池），每次请求完整执行一次安全连接流水线。
+- **部署与连接形态**：服务内部只监听 HTTP，公网 HTTPS 由前置反向代理（如 Caddy）终止；可通过 `cargo run`、Docker 或 `deploy.sh` 运行，以 `curl` 或浏览器调用。HTTP/1.1 上游采用安全的 Keep-Alive 连接池（`src/pool.rs`，按 origin 隔离、取出复核 `AddressPolicy`、受 `POOL_MAX_LIFETIME` 约束、`POOL_MAX_IDLE_PER_HOST=0` 可一键关闭）；WebSocket 始终建立新鲜连接，不入池。
 
 ## 核心使用流程
 

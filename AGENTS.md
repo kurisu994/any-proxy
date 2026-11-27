@@ -6,9 +6,11 @@
 
 - `src/main.rs`：进程入口、配置加载、启动 gate、`health-check` 子命令、宿主接口刷新调度与 SIGTERM 优雅关闭。
 - `src/app.rs`：Axum Router 组装。
-- `src/concurrency.rs`：进程级并发上限；permit 挂在响应 Body 上，流结束才释放，饱和时返回 503。
+- `src/concurrency.rs`：进程级并发上限；HTTP permit 挂在响应 Body 上、WebSocket permit 经 `PermitSlot` 移交转发任务，会话结束才释放，饱和时返回 503。
 - `src/budget.rs`：全局出口字节预算与令牌桶限速（C1 批次 2）。
-- `src/body_timeout.rs`：逐 frame idle timeout 的 Body 包装，防止慢速流长期占用连接。
+- `src/pool.rs`：安全的 HTTP/1.1 Keep-Alive 上游连接池（按 origin 隔离、取出复核 `AddressPolicy`、仅 EOF 归还、`POOL_MAX_IDLE_PER_HOST=0` 可关闭）。
+- `src/ws.rs`：基于 Hyper 原生 Upgrade 的 WebSocket 透明升级与带空闲超时/预算记账的全双工转发。
+- `src/body_timeout.rs`：逐 frame idle timeout 的 Body 包装，防止慢速流长期占用连接，并在正常 EOF 时触发连接池归还回调。
 - `src/proxy.rs`：核心代理编排，集成 Connector、重定向状态机与流式 Body 桥接。
 - `src/config.rs`：环境变量解析、校验与 typed Config。
 - `src/headers.rs`：请求/响应 header 清理与 CORS 预检/响应头。
@@ -18,7 +20,7 @@
 - `src/resolver.rs`：DNS 解析、fail-closed 公网地址策略和连接地址固定。
 - `src/connector.rs`：在一次调用中完成 resolve、全量校验、dial 和 TLS 握手。
 - `src/redirect.rs`：重定向状态机、降级拦截与逐跳复查。
-- `tests/`：本地 HTTP/HTTPS fixture、Connector 集成测试、TLS spike、M1 端到端 relay 测试、并发/流生命周期回归测试和流式内存上界回归测试（`streaming_memory.rs`）。
+- `tests/`：本地 HTTP/HTTPS fixture、Connector 集成测试、TLS spike、M1 端到端 relay 测试、并发/流生命周期回归测试、连接池与 WebSocket 端到端测试（`pool_and_ws.rs`）和流式内存上界回归测试（`streaming_memory.rs`）。
 - `Dockerfile`、`docker-compose.yml`、`docker-compose.caddy.yml`、`Caddyfile`、`deploy.sh`：多阶段构建、单容器与 Caddy 公网 HTTPS 一键部署。
 - `DESIGN.md`：**当前**安全模型、模块边界、资源边界与错误契约，含已知偏差清单；涉及行为调整前应先核对这里的约束。它只描述已实现的行为，不写承诺。
 - `docs/adr/0001-any-proxy-relay-design.md`：立项时的设计推演与备选方案，历史快照，不再维护。其中若干 premise 已被实现推翻，不要据此判断当前行为。
@@ -48,12 +50,13 @@ cargo run --release
 - `cargo build`：编译 library、binary 和依赖，适合完成一组修改后的快速验证。
 - `cargo fmt --check`：检查 Rustfmt 格式，不修改文件；需要修复时运行 `cargo fmt`。
 - `cargo clippy --all-targets -- -D warnings`：运行静态检查；CI 已加 `--all-targets`，测试代码的 lint 同样会被拦截。
-- `cargo test`：运行全部测试，当前共 175 个（默认运行通过 174 个，另有 1 个默认 ignore 的 35 秒长传输回归，用 `cargo test --test concurrency -- --ignored` 手动跑）。
+- `cargo test`：运行全部测试，当前共 206 个（默认运行通过 205 个，另有 1 个默认 ignore 的 35 秒长传输回归，用 `cargo test --test concurrency -- --ignored` 手动跑）。
 - `cargo test <test_name>`：只运行指定测试，适合开发时快速反馈。
 - `cargo test --test integration`：只运行 Connector 集成测试。
 - `cargo test --test tls_spike`：只运行 TLS fixture 测试。
 - `cargo test --test relay`：只运行 M1 端到端集成测试。
 - `cargo test --test concurrency`：只运行并发上限与流生命周期回归测试。
+- `cargo test --test pool_and_ws`：只运行上游连接池与 WebSocket 透明升级端到端回归测试。
 - `cargo test --test streaming_memory`：只运行 256 MiB 流式内存上界回归测试。
 - `cargo run --release`：启动代理服务，默认监听 `0.0.0.0:8080`。
 - `LISTEN_ADDR=127.0.0.1:9090 cargo run --release`：指定监听地址启动。

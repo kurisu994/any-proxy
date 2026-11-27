@@ -32,11 +32,13 @@ where
         config.max_egress_bytes,
         config.rate_limit_rps,
     ));
+    let pool = Arc::new(crate::pool::UpstreamPool::from_config(&config));
 
     let state = ProxyState {
         connector,
         config: config.clone(),
         budget,
+        pool,
     };
 
     let semaphore = Arc::new(Semaphore::new(config.max_concurrent_requests));

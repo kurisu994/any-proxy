@@ -22,14 +22,17 @@ use axum::response::Response;
 use http::request::Builder as RequestBuilder;
 
 use crate::body_timeout;
+use crate::concurrency::PermitSlot;
 use crate::config::Config;
 use crate::connector::{Connector, Dialer};
 use crate::error;
 use crate::headers;
+use crate::pool::{PoolKey, PooledConnection, UpstreamPool};
 use crate::redirect::{Method as ProxyMethod, RedirectAction, RedirectMachine};
 use crate::resolver::Resolver;
 use crate::target::{parse_target, Target};
 use crate::telemetry;
+use crate::ws;
 
 /// 代理共享状态
 ///
@@ -39,6 +42,7 @@ pub struct ProxyState<R, D> {
     pub connector: Arc<Connector<R, D>>,
     pub config: Arc<Config>,
     pub budget: Arc<crate::budget::Budget>,
+    pub pool: Arc<UpstreamPool>,
 }
 
 impl<R, D> Clone for ProxyState<R, D> {
@@ -47,6 +51,7 @@ impl<R, D> Clone for ProxyState<R, D> {
             connector: self.connector.clone(),
             config: self.config.clone(),
             budget: self.budget.clone(),
+            pool: self.pool.clone(),
         }
     }
 }
@@ -57,14 +62,13 @@ impl<R, D> Clone for ProxyState<R, D> {
 /// - `GET /healthz` → 健康检查
 /// - `GET /` → 首页
 /// - `OPTIONS /<url>` → CORS 预检
-/// - `GET|HEAD|POST|PUT|PATCH|DELETE /<url>` → 代理转发
+/// - `GET /<ws|wss|http|https-url>` + `Upgrade: websocket` → WebSocket 透明升级转发
+/// - `GET|HEAD|POST|PUT|PATCH|DELETE /<url>` → HTTP 流式代理转发（复用上游连接池）
 /// - 其他方法 → 405
 pub async fn proxy_handler<R, D>(
     State(state): State<ProxyState<R, D>>,
     OriginalUri(original_uri): OriginalUri,
-    method: http::Method,
-    req_headers: http::HeaderMap,
-    body: Body,
+    mut req: axum::extract::Request,
 ) -> Response
 where
     R: Resolver + 'static,
@@ -72,6 +76,8 @@ where
 {
     let request_id = telemetry::generate_request_id();
     let start = std::time::Instant::now();
+    let method = req.method().clone();
+    let req_headers = req.headers().clone();
 
     let raw_path = original_uri
         .path_and_query()
@@ -190,6 +196,43 @@ where
         }
     };
 
+    // WebSocket 协议与开关检查（全部在触网前完成，保证被拒请求零 resolve、零 dial）
+    let is_ws_upgrade = ws::is_websocket_upgrade_request(&method, &req_headers);
+    if is_ws_upgrade && !state.config.allow_websocket {
+        let resp = error::build_error_response(
+            &crate::ProxyError::TargetBlocked {
+                message: "WebSocket 代理已禁用".into(),
+            },
+            &request_id,
+        );
+        log_complete(
+            &request_id,
+            &method,
+            &resp,
+            start,
+            Some("target_blocked"),
+            Some(&target),
+        );
+        return resp;
+    }
+    if !is_ws_upgrade && target.scheme.is_ws() {
+        let resp = error::build_error_response(
+            &crate::ProxyError::InvalidTarget {
+                message: "WebSocket 目标需要 Upgrade: websocket 握手请求".into(),
+            },
+            &request_id,
+        );
+        log_complete(
+            &request_id,
+            &method,
+            &resp,
+            start,
+            Some("invalid_target"),
+            Some(&target),
+        );
+        return resp;
+    }
+
     // C1 目标 host / 端口 allowlist（未配置时不限）
     if !state.config.target_allowed(&target.host.as_str())
         || !state.config.port_allowed(target.port)
@@ -227,6 +270,55 @@ where
         );
         return resp;
     }
+
+    // WebSocket 透明升级路径（在拆解 req 前取出 OnUpgrade 与并发 PermitSlot）
+    if is_ws_upgrade {
+        let permit_slot = req.extensions().get::<PermitSlot>().cloned();
+        let inbound_upgrade = hyper::upgrade::on(&mut req);
+        let result = ws::handle_websocket_upgrade(
+            &state,
+            &target,
+            req_headers,
+            inbound_upgrade,
+            permit_slot,
+            &request_id,
+            &cors_origin,
+        )
+        .await;
+        return match result {
+            Ok(resp) => {
+                let error_code = if resp.status().is_server_error() {
+                    Some("upstream_error")
+                } else {
+                    None
+                };
+                log_complete(
+                    &request_id,
+                    &method,
+                    &resp,
+                    start,
+                    error_code,
+                    Some(&target),
+                );
+                resp
+            }
+            Err(e) => {
+                let code = e.code();
+                let resp = error::build_error_response(&e, &request_id);
+                log_complete(
+                    &request_id,
+                    &method,
+                    &resp,
+                    start,
+                    Some(code),
+                    Some(&target),
+                );
+                resp
+            }
+        };
+    }
+
+    let body = req.into_body();
 
     // 对上传 body 应用 idle timeout（并把出口字节计入全局预算）
     let body = body_timeout::wrap_request_body(
@@ -317,37 +409,12 @@ where
             headers::build_host_header(&current_target),
         );
 
-        tracing::debug!(
-            request_id = %request_id,
-            target = %current_target.display_safe(),
-            "连接上游"
-        );
-
-        // 建立 TCP(+TLS) 连接（Connector 内部有各阶段超时）
-        let conn = state.connector.connect(&current_target).await?;
-
-        // 包装 stream 为 Hyper Io
-        let io = hyper_util::rt::TokioIo::new(conn.stream);
-
-        // HTTP/1.1 握手
-        let (mut sender, connection) =
-            hyper::client::conn::http1::handshake(io)
-                .await
-                .map_err(|e| crate::ProxyError::UpstreamFailed {
-                    message: format!("HTTP 握手失败: {e}"),
-                })?;
-
-        // 驱动连接直到自然结束。
-        //
-        // 这里**不能**再包一层总时长 timeout：连接 future 覆盖整个请求，
-        // 给它设总上限等于给「任何一次代理传输」设总上限，
-        // 会把持续有数据流动的长下载/长上传静默截断（客户端拿到 200 + 半截 body）。
-        // 卡死场景由 body_timeout 的逐 frame idle timeout 兜底；
-        // 连接任务的总量由 concurrency::limit_concurrency 的 permit 兜底
-        // （permit 持有到响应 Body 结束，覆盖整个流的生命周期）。
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
+        // 尝试从安全上游连接池取一条空闲连接；若无可用连接则走 Connector 建立新连接。
+        // 取出后在真正发送任何请求字节前先执行 `sender.ready().await` 探测半关闭连接，
+        // 失败则透明丢弃并回退新建，确保非幂等 POST 也能零副作用避开死连接。
+        let pool_key = PoolKey::from_target(&current_target);
+        let mut pooled_conn =
+            acquire_upstream_connection(state, &current_target, &pool_key, request_id).await?;
 
         // 构建上游请求
         let request_target = current_target.request_target();
@@ -367,7 +434,7 @@ where
         // 发送请求并等待响应 headers（带超时）
         let response = tokio::time::timeout(
             state.config.upstream_headers_timeout,
-            sender.send_request(upstream_req),
+            pooled_conn.sender.send_request(upstream_req),
         )
         .await
         .map_err(|_| crate::ProxyError::UpstreamTimeout)?
@@ -403,6 +470,8 @@ where
                         new_target = %new_target.display_safe(),
                         "跟随重定向"
                     );
+                    // 重定向时不归还旧连接（3xx 响应体未被完整消费，避免脏流污染池）
+                    drop(pooled_conn);
                     current_target = new_target;
                     continue;
                 }
@@ -410,9 +479,10 @@ where
                     // 原样返回 3xx
                     return build_proxy_response(
                         response,
-                        &state.config,
+                        state,
                         Arc::from(request_id),
-                        state.budget.clone(),
+                        pool_key,
+                        pooled_conn,
                     );
                 }
             }
@@ -421,32 +491,122 @@ where
         // 非重定向，返回响应
         return build_proxy_response(
             response,
-            &state.config,
+            state,
             Arc::from(request_id),
-            state.budget.clone(),
+            pool_key,
+            pooled_conn,
         );
     }
 }
 
-/// 构建代理响应：清理 headers + 添加 CORS + 应用 idle timeout + 转换 body
-fn build_proxy_response(
+/// 获取一条就绪的上游 HTTP/1.1 连接：优先安全复用连接池，否则经 `Connector` 新建
+async fn acquire_upstream_connection<R, D>(
+    state: &ProxyState<R, D>,
+    target: &Target,
+    pool_key: &PoolKey,
+    request_id: &str,
+) -> Result<PooledConnection, crate::ProxyError>
+where
+    R: Resolver + 'static,
+    D: Dialer + 'static,
+{
+    let ready_timeout = state
+        .config
+        .connect_timeout
+        .min(std::time::Duration::from_secs(2));
+    while let Some(mut pooled) = state.pool.checkout(pool_key, state.connector.policy()) {
+        match tokio::time::timeout(ready_timeout, pooled.sender.ready()).await {
+            Ok(Ok(())) => {
+                tracing::debug!(
+                    request_id = %request_id,
+                    target = %target.display_safe(),
+                    "复用上游连接池连接"
+                );
+                return Ok(pooled);
+            }
+            _ => {
+                tracing::debug!(
+                    request_id = %request_id,
+                    target = %target.display_safe(),
+                    "丢弃已关闭或未就绪的池化连接，尝试下一条"
+                );
+            }
+        }
+    }
+
+    tracing::debug!(
+        request_id = %request_id,
+        target = %target.display_safe(),
+        "连接上游"
+    );
+
+    // 建立 TCP(+TLS) 连接（Connector 内部有各阶段超时）
+    let conn = state.connector.connect(target).await?;
+    let peer_addr = conn.peer_addr;
+
+    // 包装 stream 为 Hyper Io
+    let io = hyper_util::rt::TokioIo::new(conn.stream);
+
+    // HTTP/1.1 握手
+    let (sender, connection) = hyper::client::conn::http1::handshake(io)
+        .await
+        .map_err(|e| crate::ProxyError::UpstreamFailed {
+            message: format!("HTTP 握手失败: {e}"),
+        })?;
+
+    // 驱动连接直到自然结束。
+    //
+    // 这里**不能**再包一层总时长 timeout：连接 future 覆盖整个请求，
+    // 给它设总上限等于给「任何一次代理传输」设总上限，
+    // 会把持续有数据流动的长下载/长上传静默截断（客户端拿到 200 + 半截 body）。
+    // 卡死场景由 body_timeout 的逐 frame idle timeout 兜底；
+    // 连接任务的总量由 concurrency::limit_concurrency 的 permit 兜底
+    // （permit 持有到响应 Body 结束，覆盖整个流的生命周期）。
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    Ok(PooledConnection::new(sender, peer_addr))
+}
+
+/// 构建代理响应：清理 headers + 添加 CORS + 应用 idle timeout + EOF 后按需归还连接池
+fn build_proxy_response<R, D>(
     response: hyper::Response<hyper::body::Incoming>,
-    config: &Config,
+    state: &ProxyState<R, D>,
     request_id: Arc<str>,
-    budget: Arc<crate::budget::Budget>,
-) -> Result<Response, crate::ProxyError> {
+    pool_key: PoolKey,
+    pooled_conn: PooledConnection,
+) -> Result<Response, crate::ProxyError>
+where
+    R: Resolver + 'static,
+    D: Dialer + 'static,
+{
+    // 必须在 clean_response_headers 删除 Connection 头之前判定是否可 Keep-Alive 复用
+    let reusable = state.pool.is_enabled() && crate::pool::is_response_keep_alive(&response);
     let (mut parts, body) = response.into_parts();
 
     // 清理响应 headers 并添加 CORS
     headers::clean_response_headers(&mut parts.headers);
     headers::add_cors_headers(&mut parts.headers);
 
+    // 仅当响应流完整正常 EOF 时才归还连接；中途超时、出错或客户端断开则直接 Drop 关闭
+    let on_complete: Option<Box<dyn FnOnce() + Send>> = if reusable {
+        let pool = state.pool.clone();
+        let policy = state.connector.policy_arc();
+        Some(Box::new(move || {
+            pool.checkin(pool_key, pooled_conn, &policy);
+        }))
+    } else {
+        None
+    };
+
     // 应用逐 frame idle timeout 到响应 body（并把出口字节计入全局预算）
-    let axum_body = body_timeout::wrap_response_body(
+    let axum_body = body_timeout::wrap_response_body_with_on_complete(
         body,
-        config.upstream_body_idle_timeout,
+        state.config.upstream_body_idle_timeout,
         request_id,
-        budget,
+        state.budget.clone(),
+        on_complete,
     );
 
     Ok(Response::from_parts(parts, axum_body))
@@ -594,11 +754,13 @@ mod tests {
             config.max_egress_bytes,
             config.rate_limit_rps,
         ));
+        let pool = Arc::new(UpstreamPool::from_config(&config));
         (
             ProxyState {
                 connector,
                 config: Arc::new(config),
                 budget,
+                pool,
             },
             resolve_calls,
         )
@@ -611,19 +773,17 @@ mod tests {
         path: &str,
         headers: Vec<(&str, &str)>,
     ) -> Response {
-        let mut hm = http::HeaderMap::new();
+        let mut builder = http::Request::builder()
+            .method(http::Method::from_bytes(method.as_bytes()).unwrap())
+            .uri(path);
         for (k, v) in headers {
-            hm.insert(
-                http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
-                http::HeaderValue::from_str(v).unwrap(),
-            );
+            builder = builder.header(k, v);
         }
+        let req = builder.body(Body::empty()).unwrap();
         proxy_handler(
             State(state),
             OriginalUri(path.parse::<http::Uri>().unwrap()),
-            http::Method::from_bytes(method.as_bytes()).unwrap(),
-            hm,
-            Body::empty(),
+            req,
         )
         .await
     }
@@ -836,5 +996,71 @@ mod tests {
         assert_eq!(resp.status(), 400);
         assert_eq!(resolve_calls.load(Ordering::SeqCst), 0);
         assert_eq!(dialer.dials.load(Ordering::SeqCst), 0);
+    }
+
+    /// 禁用 WebSocket 后，WS 升级请求在触网前即返回 403，零 resolve、零 dial
+    #[tokio::test]
+    async fn test_ws_disabled_never_resolves_or_dials() {
+        let dialer = ScriptedDialer::new(OK_RESPONSE);
+        let config = Config {
+            allow_websocket: false,
+            ..Default::default()
+        };
+        let (state, resolve_calls) = state_with(config, dialer.clone());
+
+        let resp = call(
+            state,
+            "GET",
+            "/wss://api.openai.com/v1/realtime",
+            vec![
+                ("connection", "Upgrade"),
+                ("upgrade", "websocket"),
+                ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+                ("sec-websocket-version", "13"),
+            ],
+        )
+        .await;
+
+        assert_eq!(resp.status(), 403);
+        assert_eq!(resolve_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(dialer.dials.load(Ordering::SeqCst), 0);
+    }
+
+    /// 非升级请求指向 ws:// / wss:// 目标应在触网前直接返回 400
+    #[tokio::test]
+    async fn test_ws_scheme_without_upgrade_rejected_before_dial() {
+        let dialer = ScriptedDialer::new(OK_RESPONSE);
+        let (state, resolve_calls) = state_with(Config::default(), dialer.clone());
+
+        let resp = call(state, "GET", "/wss://api.openai.com/v1/realtime", vec![]).await;
+
+        assert_eq!(resp.status(), 400);
+        assert_eq!(resolve_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(dialer.dials.load(Ordering::SeqCst), 0);
+    }
+
+    /// 非 websocket 的 Upgrade（如 h2c）不会被升级，且 Upgrade 头会被剥离
+    #[tokio::test]
+    async fn test_non_websocket_upgrade_stripped() {
+        let dialer = ScriptedDialer::new(OK_RESPONSE);
+        let (state, _) = state_with(Config::default(), dialer.clone());
+
+        let resp = call(
+            state,
+            "GET",
+            "/http://example.com/x",
+            vec![("connection", "Upgrade"), ("upgrade", "h2c")],
+        )
+        .await;
+
+        assert_eq!(resp.status(), 200);
+        let seen = dialer.seen_requests.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        let lower = seen[0].to_ascii_lowercase();
+        assert!(
+            !lower.contains("upgrade:"),
+            "非 websocket Upgrade 头应被剥离: {}",
+            seen[0]
+        );
     }
 }

@@ -26,7 +26,7 @@ paths:
 ## Target 解析与规范化 (`src/target.rs`)
 
 - `parse_target` 接收 `OriginalUri` 的 `path_and_query`，**只剥离恰好一个前导 `/`**，不折叠重复斜线、不二次 percent-decode；兼容前置反向代理折叠后的 `/https:/...` 形态（有回归测试锁定）。
-- 只接受 `http` 与 `https`；拒绝 userinfo、空主机、端口 `0`；允许端口 `1..=65535`。
+- 只接受 `http`、`https`、`ws`、`wss`；拒绝 userinfo、空主机、端口 `0`；允许端口 `1..=65535`；`ws`/`wss` 默认端口分别为 `80`/`443`（普通非升级 HTTP 请求指向 `ws`/`wss` 会在 `proxy.rs` 触网前被 400 拒绝）。
 - 处理 IDNA 域名、去除域名尾点，识别 IPv4 与带/不带方括号的 IPv6 字面量。
 - 关键输出方法：
   - `authority()`：默认端口（HTTP 80 / HTTPS 443）省略；**IPv6 字面量必须按 RFC 3986 用方括号包裹**（如 `[2606:4700::1]:8443`），否则 `Host` header 与 URL 拼接都会畸形。
@@ -53,7 +53,7 @@ paths:
   4. **复核 `peer_addr` 必须属于本次已验证的 `SocketAddr` 集合**，不匹配则弃用并仅记内部 warn（不回显 `peer_addr`）
   5. HTTPS 目标执行 `tokio-rustls` TLS 握手（套 `tls` 超时），SNI 与证书校验使用原始规范化 `canonical_host`，TCP 走已固定的 IP
 - `create_tls_config()` 加载系统根证书；根证书加载为空时必须直接 `exit(1)`，不「假活着」。
-- 上游连接**不复用**（无连接池），每次请求走完整安全流水线。
+- `Connector` 暴露 `policy()` 与 `policy_arc()` 供上游连接池在取出空闲连接时复核 `AddressPolicy::is_allowed(&peer_addr)`；任何新建连接与 WebSocket 升级连接都必须走完本安全流水线。
 
 ## 重定向状态机 (`src/redirect.rs`)
 

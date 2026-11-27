@@ -18,11 +18,13 @@ pub mod config;
 pub mod connector;
 pub mod error;
 pub mod headers;
+pub mod pool;
 pub mod proxy;
 pub mod redirect;
 pub mod resolver;
 pub mod target;
 pub mod telemetry;
+pub mod ws;
 
 /// 代理错误码
 ///

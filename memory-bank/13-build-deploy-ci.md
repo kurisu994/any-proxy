@@ -18,7 +18,7 @@ paths:
 ## 工具链与依赖 (`Cargo.toml`)
 
 - **Crate**：`any-proxy` `0.1.0`，Rust edition 2021，**MSRV `1.86`**（受 `url`/`icu` 传递依赖约束，CI `msrv` 作业强制锁定；历史文档提到的 1.75 已过时）。
-- **Targets**：1 个 `lib`、1 个 `bin`（`src/main.rs`），以及 `fixture`、`integration`、`tls_spike`、`relay`、`concurrency`、`streaming_memory` 六个测试文件，使用 `#[test]` 与 `#[tokio::test]`，当前共 175 个测试（默认通过 174 个，另有 1 个默认 ignore 的 35 秒长传输回归）。`.gitignore` 忽略 `.env`、`/target` 及覆盖率产物。
+- **Targets**：1 个 `lib`、1 个 `bin`（`src/main.rs`），以及 `fixture`、`integration`、`tls_spike`、`relay`、`concurrency`、`pool_and_ws`、`streaming_memory` 七个测试文件，使用 `#[test]` 与 `#[tokio::test]`，当前共 206 个测试（默认通过 205 个，另有 1 个默认 ignore 的 35 秒长传输回归）。`.gitignore` 忽略 `.env`、`/target` 及覆盖率产物。
 - **Release Profile**：`opt-level=3`、`lto = true`、`codegen-units = 1`、`strip = true`。
 - **核心直接依赖**：`tokio`、`url`、`ipnet`、`if-addrs`、`trait-variant`、`serde`/`serde_json`、`tracing`/`tracing-subscriber`、`http`、`http-body`、`bytes`、`axum`、`hyper`、`hyper-util`（仅 `tokio` feature，不启 `client-legacy`）、`rustls`（ring）、`rustls-native-certs`、`tokio-rustls`、`http-body-util`；dev 依赖含 `rcgen` 与 `tokio/test-util`。早期未使用的 `tower`、`futures-util`、`rustls-pemfile` 直接依赖已移除。
 - **已知传递依赖告警**：`RUSTSEC-2025-0134`（`rustls-pemfile` 未维护）来自 `rustls-native-certs 0.7`，仅 informational、0 漏洞，不阻塞；待上游升级。新增或升级依赖须同步更新 `Cargo.lock` 并说明安全影响。
@@ -65,6 +65,6 @@ push / PR 到 `main` 时运行四个作业：
 ## Caddy 公网 HTTPS 与 `deploy.sh`
 
 - **`Caddyfile`**：配置 `flush_interval -1` 禁用响应缓冲，且**不设上游响应超时**（防破坏流式无总时长语义）；改完用 `caddy validate` 校验。注意 Caddy JSON 访问日志默认含完整 URI（含 query），目标 API 靠 query 传密钥时需按需调整。
-- **`docker-compose.caddy.yml`**：默认拉固定版本镜像 `kurisu003/any-proxy:0.1.0`（备用 `ghcr.io/kurisu994/any-proxy:0.1.0`，禁止默认用 `latest`；跑本地改动用 `ANY_PROXY_IMAGE=any-proxy:dev`），不在 VPS 上编译 Rust 防 OOM；`any-proxy` 仅 `expose: 8080`，公网入口只有 Caddy；默认保留 `RATE_LIMIT_RPS=10` 与 `MAX_EGRESS_BYTES=10GiB`，访问控制留空并置 `PUBLIC_MODE=1`。
+- **`docker-compose.caddy.yml`**：默认拉固定版本镜像 `kurisu003/any-proxy:0.1.0`（备用 `ghcr.io/kurisu994/any-proxy:0.1.0`，禁止默认用 `latest`；跑本地改动用 `ANY_PROXY_IMAGE=any-proxy:dev`），不在 VPS 上编译 Rust 防 OOM；`any-proxy` 仅 `expose: 8080`，公网入口只有 Caddy；默认保留 `RATE_LIMIT_RPS=10` 与 `MAX_EGRESS_BYTES=10GiB`，并透传大模型超时（`UPSTREAM_HEADERS_TIMEOUT=180s`、`UPSTREAM_BODY_IDLE_TIMEOUT=180s`）、WebSocket（`ALLOW_WEBSOCKET=true`、`WS_IDLE_TIMEOUT=300s`）与连接池（`POOL_MAX_IDLE_PER_HOST=8`）变量。
 - **`deploy.sh` 与 `.env.example`**：无需 clone 仓库，缺配置时自动生成 `Caddyfile` 与 `docker-compose.caddy.yml`；取值优先级为「命令行参数 > shell 环境变量 > `.env` > 默认值」；前置拦截 IP 域名、DNS 未指向本机、80/443 占用，主镜像源失败自动切 GHCR；启动后采用**三段快速探测**（容器运行态 → 内部 `health-check` → Caddy ACME 日志 + HTTPS），失败秒退。
 - **Shell 兼容坑点**：`deploy.sh` 中紧挨中文字符的变量必须写成 `${VAR}`，否则 macOS 老 bash 3.2 在 `set -u` 下会把中文首字节并入变量名报 unbound variable。

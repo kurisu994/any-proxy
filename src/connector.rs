@@ -177,6 +177,16 @@ where
         self
     }
 
+    /// 返回连接器持有的地址策略（供上游连接池在取出空闲连接时复核 peer_addr）
+    pub fn policy(&self) -> &AddressPolicy {
+        &self.policy
+    }
+
+    /// 返回地址策略的共享引用（供连接池完成回调零拷贝复用）
+    pub fn policy_arc(&self) -> Arc<AddressPolicy> {
+        Arc::clone(&self.policy)
+    }
+
     /// 安全连接：resolve → validate → select → dial → (TLS) → 记录 peer_addr
     ///
     /// 任何策略失败都在建立上游连接前返回错误（零次 dial）。

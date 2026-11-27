@@ -65,6 +65,12 @@ services:
       - MAX_EGRESS_BYTES=${MAX_EGRESS_BYTES:-10737418240} # 10 GiB
       - MAX_CONCURRENT_REQUESTS=${MAX_CONCURRENT_REQUESTS:-256}
       - DENY_CIDRS=${DENY_CIDRS:-}
+      # 大模型与实时流超时/协议/连接池（均支持按需覆盖，缺省走程序内置默认值）
+      - UPSTREAM_HEADERS_TIMEOUT=${UPSTREAM_HEADERS_TIMEOUT:-180s}
+      - UPSTREAM_BODY_IDLE_TIMEOUT=${UPSTREAM_BODY_IDLE_TIMEOUT:-180s}
+      - ALLOW_WEBSOCKET=${ALLOW_WEBSOCKET:-true}
+      - WS_IDLE_TIMEOUT=${WS_IDLE_TIMEOUT:-300s}
+      - POOL_MAX_IDLE_PER_HOST=${POOL_MAX_IDLE_PER_HOST:-8}
     healthcheck:
       test: ["CMD", "any-proxy", "health-check"]
       interval: 30s

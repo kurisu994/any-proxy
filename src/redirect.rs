@@ -15,7 +15,7 @@
 
 use std::collections::HashSet;
 
-use crate::target::{Scheme, Target};
+use crate::target::Target;
 
 /// 重定向跟随决策
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,8 +111,8 @@ impl RedirectMachine {
             None => return Ok(RedirectAction::PassThrough),
         };
 
-        // HTTPS 降级检查
-        if current_target.scheme == Scheme::Https && new_target.scheme == Scheme::Http {
+        // TLS 降级检查（阻止 HTTPS/WSS 降级到明文 HTTP/WS）
+        if current_target.scheme.is_tls() && !new_target.scheme.is_tls() {
             return Err(crate::ProxyError::TargetBlocked {
                 message: "HTTPS 降级到 HTTP 不允许".into(),
             });
@@ -218,7 +218,7 @@ fn canonical_url(target: &Target) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::target::Host;
+    use crate::target::{Host, Scheme};
 
     fn https_target(host: &str, port: u16) -> Target {
         Target {

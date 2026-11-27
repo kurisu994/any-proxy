@@ -38,12 +38,24 @@ pub struct Config {
     pub connect_timeout: Duration,
     /// TLS 握手超时
     pub tls_timeout: Duration,
-    /// 上游响应 headers 等待超时
+    /// 上游响应 headers 等待超时（默认 180s，适配大模型慢首包与深度思考）
     pub upstream_headers_timeout: Duration,
     /// 上传空闲超时（相邻 frame 间隔）
     pub upload_idle_timeout: Duration,
-    /// 上游响应 body 空闲读取超时
+    /// 上游响应 body 空闲读取超时（默认 180s，适配大模型流式思考停顿）
     pub upstream_body_idle_timeout: Duration,
+    /// 是否允许 WebSocket 透明升级转发（默认 true）
+    pub allow_websocket: bool,
+    /// WebSocket 双向空闲超时（任一方向有数据即重置，默认 300s）
+    pub ws_idle_timeout: Duration,
+    /// 上游连接池每 host 最大空闲连接数（0 = 关闭连接池，默认 8）
+    pub pool_max_idle_per_host: usize,
+    /// 上游连接池全局最大空闲连接数（0 = 关闭连接池，默认 64）
+    pub pool_max_idle_total: usize,
+    /// 池内空闲连接超时（仅淘汰空闲连接，绝不作用于活跃传输流，默认 60s）
+    pub pool_idle_timeout: Duration,
+    /// 池内连接最大存活时长（到期强制重建并重新 DNS 解析，默认 300s）
+    pub pool_max_lifetime: Duration,
     /// 优雅关闭等待时间
     pub shutdown_grace: Duration,
     /// 宿主接口地址刷新间隔
@@ -66,9 +78,15 @@ impl Default for Config {
             dns_timeout: Duration::from_secs(5),
             connect_timeout: Duration::from_secs(10),
             tls_timeout: Duration::from_secs(10),
-            upstream_headers_timeout: Duration::from_secs(30),
+            upstream_headers_timeout: Duration::from_secs(180),
             upload_idle_timeout: Duration::from_secs(30),
-            upstream_body_idle_timeout: Duration::from_secs(60),
+            upstream_body_idle_timeout: Duration::from_secs(180),
+            allow_websocket: true,
+            ws_idle_timeout: Duration::from_secs(300),
+            pool_max_idle_per_host: 8,
+            pool_max_idle_total: 64,
+            pool_idle_timeout: Duration::from_secs(60),
+            pool_max_lifetime: Duration::from_secs(300),
             shutdown_grace: Duration::from_secs(30),
             host_refresh_interval: Duration::from_secs(60),
         }
@@ -139,6 +157,20 @@ impl Config {
             1,
             3600,
         )?;
+        config.allow_websocket = env_bool_default("ALLOW_WEBSOCKET", config.allow_websocket)?;
+        config.ws_idle_timeout = env_duration("WS_IDLE_TIMEOUT", config.ws_idle_timeout, 1, 3600)?;
+        config.pool_max_idle_per_host = env_usize(
+            "POOL_MAX_IDLE_PER_HOST",
+            config.pool_max_idle_per_host,
+            0,
+            256,
+        )?;
+        config.pool_max_idle_total =
+            env_usize("POOL_MAX_IDLE_TOTAL", config.pool_max_idle_total, 0, 4096)?;
+        config.pool_idle_timeout =
+            env_duration("POOL_IDLE_TIMEOUT", config.pool_idle_timeout, 1, 3600)?;
+        config.pool_max_lifetime =
+            env_duration("POOL_MAX_LIFETIME", config.pool_max_lifetime, 1, 86400)?;
         config.shutdown_grace = env_duration("SHUTDOWN_GRACE", config.shutdown_grace, 1, 300)?;
         config.host_refresh_interval = env_duration(
             "HOST_REFRESH_INTERVAL",
@@ -239,6 +271,21 @@ fn env_bool(key: &str) -> bool {
     }
 }
 
+/// 读取带默认值的布尔环境变量，非法值 fail-closed 报错
+fn env_bool_default(key: &str, default: bool) -> Result<bool, ConfigError> {
+    match env_str(key) {
+        Some(s) => match s.to_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            _ => Err(ConfigError::new(
+                key,
+                format!("无效布尔值 `{s}`（期望 true/false/1/0）"),
+            )),
+        },
+        None => Ok(default),
+    }
+}
+
 /// 读取可选正整数环境变量（未设=None，值必须 >0，非法 fail-closed）
 fn env_opt_u64(key: &str) -> Result<Option<u64>, ConfigError> {
     match env_str(key) {
@@ -324,6 +371,14 @@ mod tests {
         assert_eq!(config.listen_addr, "0.0.0.0:8080".parse().unwrap());
         assert_eq!(config.max_concurrent_requests, 256);
         assert_eq!(config.dns_timeout, Duration::from_secs(5));
+        assert_eq!(config.upstream_headers_timeout, Duration::from_secs(180));
+        assert_eq!(config.upstream_body_idle_timeout, Duration::from_secs(180));
+        assert!(config.allow_websocket);
+        assert_eq!(config.ws_idle_timeout, Duration::from_secs(300));
+        assert_eq!(config.pool_max_idle_per_host, 8);
+        assert_eq!(config.pool_max_idle_total, 64);
+        assert_eq!(config.pool_idle_timeout, Duration::from_secs(60));
+        assert_eq!(config.pool_max_lifetime, Duration::from_secs(300));
         assert_eq!(config.shutdown_grace, Duration::from_secs(30));
     }
 
@@ -461,5 +516,41 @@ mod tests {
         assert!(c.auth_token.is_none());
         assert!(c.allow_ports.is_empty());
         assert!(!c.public_mode, "默认零配置：所有安全带关闭，向后兼容");
+    }
+
+    #[test]
+    fn test_ws_and_pool_env_parsing() {
+        let _lock = env_lock();
+        std::env::set_var("ALLOW_WEBSOCKET", "false");
+        std::env::set_var("WS_IDLE_TIMEOUT", "120s");
+        std::env::set_var("POOL_MAX_IDLE_PER_HOST", "0");
+        std::env::set_var("POOL_IDLE_TIMEOUT", "45");
+        std::env::set_var("POOL_MAX_LIFETIME", "600s");
+
+        let c = Config::from_env().unwrap();
+        for k in [
+            "ALLOW_WEBSOCKET",
+            "WS_IDLE_TIMEOUT",
+            "POOL_MAX_IDLE_PER_HOST",
+            "POOL_IDLE_TIMEOUT",
+            "POOL_MAX_LIFETIME",
+        ] {
+            std::env::remove_var(k);
+        }
+
+        assert!(!c.allow_websocket);
+        assert_eq!(c.ws_idle_timeout, Duration::from_secs(120));
+        assert_eq!(c.pool_max_idle_per_host, 0, "设为 0 应允许关闭连接池");
+        assert_eq!(c.pool_idle_timeout, Duration::from_secs(45));
+        assert_eq!(c.pool_max_lifetime, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn test_allow_websocket_invalid_bool_fails() {
+        let _lock = env_lock();
+        std::env::set_var("ALLOW_WEBSOCKET", "maybe");
+        let res = Config::from_env();
+        std::env::remove_var("ALLOW_WEBSOCKET");
+        assert!(res.is_err(), "非法布尔值应 fail-closed");
     }
 }

@@ -215,9 +215,15 @@ any-proxy 的安全边界完全在**目标地址校验**：
 | `DNS_TIMEOUT` | 5s | DNS 解析超时 |
 | `CONNECT_TIMEOUT` | 10s | TCP 连接超时 |
 | `TLS_TIMEOUT` | 10s | TLS 握手超时 |
-| `UPSTREAM_HEADERS_TIMEOUT` | 30s | 等待上游响应 headers 超时 |
+| `UPSTREAM_HEADERS_TIMEOUT` | 180s | 等待上游响应头超时（适配大模型慢首包与深度思考，1-600s） |
 | `UPLOAD_IDLE_TIMEOUT` | 30s | 上传空闲超时 |
-| `UPSTREAM_BODY_IDLE_TIMEOUT` | 60s | 下载空闲超时 |
+| `UPSTREAM_BODY_IDLE_TIMEOUT` | 180s | 下载逐 frame 空闲超时（适配流式思考停顿，1-3600s） |
+| `ALLOW_WEBSOCKET` | true | 是否允许 WebSocket 透明升级转发（`ws://`/`wss://`） |
+| `WS_IDLE_TIMEOUT` | 300s | WebSocket 双向空闲超时（1-3600s） |
+| `POOL_MAX_IDLE_PER_HOST` | 8 | 上游 HTTP/1.1 连接池每 host 空闲上限（`0` = 关闭连接池） |
+| `POOL_MAX_IDLE_TOTAL` | 64 | 上游连接池全局最大空闲连接数（`0` = 关闭连接池） |
+| `POOL_IDLE_TIMEOUT` | 60s | 池内空闲连接淘汰超时（仅作用于空闲连接，不截断活跃流） |
+| `POOL_MAX_LIFETIME` | 300s | 池内连接最大存活时长（到期强制重建并重新 DNS 解析） |
 | `SHUTDOWN_GRACE` | 30s | 优雅关闭等待时间 |
 | `HOST_REFRESH_INTERVAL` | 60s | 宿主接口地址刷新间隔 |
 | `RUST_LOG` | info | 日志级别 |
@@ -247,7 +253,8 @@ LISTEN_ADDR=127.0.0.1:8080 ./any-proxy
 
 | 路径 | 方法 | 说明 |
 |------|------|------|
-| `/<absolute-http-or-https-url>` | GET/HEAD/POST/PUT/PATCH/DELETE | 核心代理入口 |
+| `/<absolute-http-or-https-url>` | GET/HEAD/POST/PUT/PATCH/DELETE | 核心代理入口（流式转发，复用安全 HTTP/1.1 Keep-Alive 连接池） |
+| `/<ws-or-wss-or-http-url>` | GET + `Upgrade: websocket` | WebSocket 透明升级转发（支持 OpenAI Realtime / Gemini Live 等） |
 | `/<absolute-http-or-https-url>` | OPTIONS | CORS 预检（固定 204） |
 | `/healthz` | GET | 进程存活检查（不占用并发配额） |
 | `/` | GET | 用法说明与风险提示 |
@@ -278,10 +285,10 @@ LISTEN_ADDR=127.0.0.1:8080 ./any-proxy
 
 - **没有总请求时长上限。** 只要数据在流动，多长的传输都不会被代理主动中断。
 - 卡死由**逐 frame 空闲超时**兜底：上传看 `UPLOAD_IDLE_TIMEOUT`，下载看 `UPSTREAM_BODY_IDLE_TIMEOUT`。
-- **并发配额覆盖整个响应流的生命周期**，不是只到响应头发出为止。因此 `MAX_CONCURRENT_REQUESTS`
-  限制的是「同时活跃的传输数」，这也是进程 socket 与上游连接任务的真实上界。
+- **并发配额覆盖整个响应流与 WebSocket 会话的生命周期**，不是只到响应头发出为止。因此 `MAX_CONCURRENT_REQUESTS`
+  限制的是「同时活跃的传输数与 WS 会话数」，这也是进程 socket 与上游连接任务的真实上界。
 - 达到上限时**立即返回 `503 service_overloaded`**，不排队。调用方应当看到「过载」而不是「卡死」。
-- 上游连接不复用：每次请求都走完整的 resolve → 全量校验 → 固定 IP → dial。
+- **安全 HTTP/1.1 Keep-Alive 连接池**：仅复用经 `Connector` 完成全量校验的同源连接，取出时复核 `AddressPolicy` 并受 `POOL_MAX_LIFETIME` 约束，且只在响应流完整 EOF 后归还；将 `POOL_MAX_IDLE_PER_HOST=0` 可随时关闭连接池。
 
 ### CORS 行为
 
@@ -335,6 +342,8 @@ cargo test --test relay             # M1 端到端集成测试
 cargo test --test integration       # Connector 集成测试
 cargo test --test tls_spike         # TLS spike 测试
 cargo test --test concurrency       # 并发上限与流生命周期回归
+cargo test --test pool_and_ws       # 上游连接池与 WebSocket 端到端回归
+cargo test --test streaming_memory  # 256 MiB 流式内存上界回归
 cargo test --test concurrency -- --ignored   # 35 秒长传输回归，默认跳过
 ```
 

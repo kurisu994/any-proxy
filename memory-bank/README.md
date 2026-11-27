@@ -36,8 +36,8 @@ memory-bank/
 | 规范文件 | 说明 | 触发路径 (`paths`) |
 |---|---|---|
 | `10-security-connector.md` | 安全内核规范：Target URL 解析、fail-closed AddressPolicy、Connector 连接固定与 TLS 握手、重定向状态机 | `src/target.rs` `src/resolver.rs` `src/connector.rs` `src/redirect.rs` `tests/integration.rs` `tests/tls_spike.rs` `tests/fixture.rs` |
-| `11-relay-http.md` | HTTP Relay 编排规范：Axum 路由、C1 访问控制与不触网拒绝、Header/CORS/Trailer 清理、稳定错误契约与隐私日志 | `src/app.rs` `src/proxy.rs` `src/headers.rs` `src/error.rs` `src/telemetry.rs` `src/lib.rs` `tests/relay.rs` |
-| `12-runtime-resources.md` | 运行时资源边界规范：环境变量配置与启动 gate、流生命周期并发 permit、逐 frame idle timeout、全局预算限速与优雅关闭 | `src/main.rs` `src/config.rs` `src/concurrency.rs` `src/body_timeout.rs` `src/budget.rs` `tests/concurrency.rs` `tests/streaming_memory.rs` |
+| `11-relay-http.md` | HTTP Relay 编排规范：Axum 路由、C1 访问控制与不触网拒绝、Header/CORS/Trailer 清理、WebSocket 透明升级与错误日志 | `src/app.rs` `src/proxy.rs` `src/headers.rs` `src/error.rs` `src/telemetry.rs` `src/lib.rs` `src/ws.rs` `tests/relay.rs` |
+| `12-runtime-resources.md` | 运行时资源边界规范：环境变量配置与启动 gate、并发 permit 生命周期、逐 frame idle timeout、安全连接池与预算限速 | `src/main.rs` `src/config.rs` `src/concurrency.rs` `src/body_timeout.rs` `src/budget.rs` `src/pool.rs` `tests/concurrency.rs` `tests/pool_and_ws.rs` `tests/streaming_memory.rs` |
 | `13-build-deploy-ci.md` | 构建依赖、容器镜像、Caddy/deploy.sh 公网部署与 CI/Release 流水线规范 | `Cargo.toml` `Dockerfile` `docker-compose*.yml` `Caddyfile` `deploy.sh` `.env.example` `.github/workflows/**` |
 
 - 单份规范体量上限：9,000 字符（`wc -m` 统计，硬上限 9,400），超限按代码路径维度继续拆分。

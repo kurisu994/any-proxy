@@ -18,7 +18,7 @@
 //! 让健康检查在满载时失败会触发编排系统重启，反而杀掉在途请求。
 
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use axum::extract::{Request, State};
@@ -26,6 +26,31 @@ use axum::middleware::Next;
 use axum::response::Response;
 use http_body::Body as HttpBody;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+/// 并发 permit 交接槽（通过请求 Extensions 传入 handler）
+///
+/// - 普通 HTTP 响应不触碰此槽：中间件在 handler 返回后取回 permit 并挂到 `GuardedBody` 上，
+///   直到响应体读完或被 Drop 才归还。
+/// - WebSocket 等协议升级成功时（101 响应体为空）：handler 通过 [`PermitSlot::take`] 接管 permit，
+///   移交给后台双向转发任务持有，确保并发上限覆盖整个 WebSocket 会话生命周期。
+#[derive(Clone)]
+pub struct PermitSlot {
+    inner: Arc<Mutex<Option<OwnedSemaphorePermit>>>,
+}
+
+impl PermitSlot {
+    /// 包装一个并发 permit
+    pub fn new(permit: OwnedSemaphorePermit) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Some(permit))),
+        }
+    }
+
+    /// 取出 permit 所有权（至多成功一次）
+    pub fn take(&self) -> Option<OwnedSemaphorePermit> {
+        self.inner.lock().ok().and_then(|mut g| g.take())
+    }
+}
 
 /// 持有并发 permit 的 Body wrapper
 ///
@@ -76,7 +101,7 @@ where
 /// 无可用 permit 时立即返回 503，不排队。
 pub async fn limit_concurrency(
     State(semaphore): State<Arc<Semaphore>>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Response {
     // /healthz 不占用 permit，也不会被上限拒绝
@@ -99,11 +124,19 @@ pub async fn limit_concurrency(
         }
     };
 
+    let slot = PermitSlot::new(permit);
+    req.extensions_mut().insert(slot.clone());
+
     let response = next.run(req).await;
 
-    // 把 permit 移交给响应 Body：流没结束前不归还
-    let (parts, body) = response.into_parts();
-    Response::from_parts(parts, axum::body::Body::new(GuardedBody::new(body, permit)))
+    // 若 handler 未接管 permit（普通 HTTP 请求或升级失败），把 permit 移交给响应 Body；
+    // 若已被 WebSocket 升级任务接管，直接返回 101 响应，permit 由后台隧道任务持有至断连。
+    if let Some(permit) = slot.take() {
+        let (parts, body) = response.into_parts();
+        Response::from_parts(parts, axum::body::Body::new(GuardedBody::new(body, permit)))
+    } else {
+        response
+    }
 }
 
 #[cfg(test)]

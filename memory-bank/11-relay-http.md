@@ -1,6 +1,6 @@
 ---
 name: 11-relay-http
-description: HTTP Relay 编排规范：Axum 路由、C1 访问控制与不触网拒绝、Header/CORS/Trailer 清理、稳定错误契约与隐私日志
+description: HTTP Relay 编排规范：Axum 路由、C1 访问控制与不触网拒绝、Header/CORS/Trailer 清理、WebSocket 透明升级与错误日志
 paths:
   - "src/app.rs"
   - "src/proxy.rs"
@@ -8,6 +8,7 @@ paths:
   - "src/error.rs"
   - "src/telemetry.rs"
   - "src/lib.rs"
+  - "src/ws.rs"
   - "tests/relay.rs"
 ---
 
@@ -19,8 +20,9 @@ paths:
 
 - `src/lib.rs`：crate 根入口，暴露公共模块与稳定 `ProxyError` 枚举及其错误码/HTTP 状态码映射。
 - `src/app.rs`：`create_app<R, D>` 泛型组装 Axum Router、`ProxyState`、`Budget` 与并发限制中间件，便于测试注入假 `Resolver`/`Dialer`。
-- `src/proxy.rs`：核心代理处理器 `proxy_handler` 与转发/重定向循环 `forward_request`。
-- `src/headers.rs`：请求/响应 hop-by-hop 与敏感头清理、CORS 预检与统一响应头、`Host` 重建。
+- `src/proxy.rs`：核心代理处理器 `proxy_handler`、WebSocket 升级分发与 HTTP 转发/连接池复用/重定向循环 `forward_request`。
+- `src/ws.rs`：基于 Hyper 原生 HTTP/1.1 Upgrade 的 WebSocket 透明升级转发（`is_websocket_upgrade_request`、`handle_websocket_upgrade`、`relay_bidirectional`），零新增依赖。
+- `src/headers.rs`：请求/响应 hop-by-hop 与敏感头清理（含 WS 升级专用的 `clean_ws_request_headers` / `clean_ws_response_headers`）、CORS 预检与统一响应头、`Host` 重建。
 - `src/error.rs`：稳定 JSON 错误响应、405、预检 204、`/healthz` 与 `/` 首页构建。
 - `src/telemetry.rs`：`tracing` 初始化、`request_id` 生成与流中止隐私日志。
 - `tests/relay.rs`（target 名 `relay`）：端到端 Relay 集成测试（录制式假上游、6 种 method、CORS、预检、C1 安全带、重定向等）。
@@ -36,9 +38,12 @@ paths:
 5. **方法白名单**：仅允许 `GET`/`HEAD`/`POST`/`PUT`/`PATCH`/`DELETE`/`OPTIONS`，其余返回 405 `method_not_allowed`（含 `Allow` 头）。
 6. **`OPTIONS` 预检**：直接返回 204（校验 `Access-Control-Request-Method` 合法且 `Access-Control-Request-Headers` `<= 8 KiB` 且各 token 为合法 RFC header 名，失败返回 400）。
 7. **目标解析**：调用 `target::parse_target`，非法返回 400 `invalid_target`。
-8. **目标 allowlist**：校验 `ALLOW_TARGETS` 与 `ALLOW_PORTS`，不命中返回 403 `target_blocked`（仅记内部 debug 日志，不对外回显 host/port）。
-9. **准入限流与预算**：调用 `Budget::check_admission()`，分别返回 429 `rate_limited` 或 503 `budget_exceeded`。
-10. **流式转发**：入站 Body 套 `wrap_request_body` 后进入 `forward_request`；通过 `hyper::client::conn::http1::handshake` 发请求，仅首跳携带入站 Body，GET/HEAD 重定向后续跳用 `Body::empty()`，跨 origin 删除 `Authorization`。响应头阶段套 `UPSTREAM_HEADERS_TIMEOUT`，响应体套 `wrap_response_body` 流式回传。
+8. **WebSocket 协议与开关校验**：判定 `ws::is_websocket_upgrade_request`（严格要求 `GET` + `Connection: upgrade` + `Upgrade: websocket` + `Sec-WebSocket-Key` + `Sec-WebSocket-Version: 13`，拒绝 `h2c` 等其他升级）；若 `allow_websocket == false` 返回 403 `target_blocked`；若非升级请求却指向 `ws`/`wss` 返回 400 `invalid_target`。
+9. **目标 allowlist**：校验 `ALLOW_TARGETS` 与 `ALLOW_PORTS`，不命中返回 403 `target_blocked`（仅记内部 debug 日志，不对外回显 host/port）。
+10. **准入限流与预算**：调用 `Budget::check_admission()`，分别返回 429 `rate_limited` 或 503 `budget_exceeded`。
+11. **分流转发**：
+    - **WebSocket 升级**：走 `ws::handle_websocket_upgrade`，始终新建 `Connector` 连接并使用 `connection.with_upgrades()`；校验上游 101 含 `Upgrade: websocket` 与 `Sec-WebSocket-Accept`（否则 502）；101 成功时通过 `PermitSlot::take()` 接管并发 permit 移交后台全双工转发任务（支持半关闭、共享 `WS_IDLE_TIMEOUT` 与双向 `Budget::add_egress` 记账）；上游非 101 时按普通响应透传并带 CORS。
+    - **HTTP 流式转发**：先尝试从 `UpstreamPool` 取出同源空闲连接并在发送字节前做 `sender.ready().await` 探活，失效则透明回退 `Connector::connect()`；入站 Body 套 `wrap_request_body`，响应头阶段套 `UPSTREAM_HEADERS_TIMEOUT`，响应体套 `wrap_response_body_with_on_complete` 流式回传，仅正常 EOF 且上游支持 Keep-Alive 时归还连接池。
 
 **关键禁止项**：`tokio::spawn(async move { let _ = connection.await; })` 驱动 Hyper 连接时**禁止套总时长 timeout**，否则会静默截断持续流动的长传输。
 

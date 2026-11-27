@@ -271,6 +271,109 @@ pub fn build_host_header(target: &crate::target::Target) -> HeaderValue {
     HeaderValue::from_str(&host_str).unwrap_or_else(|_| HeaderValue::from_static("invalid"))
 }
 
+/// 清理 WebSocket 升级请求 headers
+///
+/// 复用常规请求清理规则（移除 Cookie、Host、Forwarded、Via、X-Proxy-*、Proxy-*、X-Forwarded-*
+/// 以及非升级类 hop-by-hop），仅白名单保留并规范化 `Connection: Upgrade` 与 `Upgrade: websocket`，
+/// 保留 `Sec-WebSocket-*` 握手头和 `Authorization` 等业务头。
+pub fn clean_ws_request_headers(headers: &mut http::HeaderMap) {
+    // 1. 删除 Connection 点名的非 upgrade 自定义 hop-by-hop 头
+    let connection_tokens: Vec<String> = headers
+        .get_all(http::header::CONNECTION)
+        .into_iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| {
+            s.split(',')
+                .map(|t| t.trim().to_lowercase())
+                .filter(|t| !t.is_empty() && t != "upgrade")
+        })
+        .collect();
+    for token in &connection_tokens {
+        if let Ok(name) = HeaderName::from_bytes(token.as_bytes()) {
+            headers.remove(&name);
+        }
+    }
+
+    // 2. 删除固定 hop-by-hop（除后续重写的 connection / upgrade 外）
+    for name in HOP_BY_HOP {
+        if *name == "connection" || *name == "upgrade" {
+            continue;
+        }
+        if let Ok(hn) = HeaderName::from_bytes(name.as_bytes()) {
+            headers.remove(&hn);
+        }
+    }
+
+    // 3. 删除敏感与代理内部头，通配删除 Proxy-* / X-Forwarded-*
+    for name in REQUEST_STRIP {
+        if let Ok(hn) = HeaderName::from_bytes(name.as_bytes()) {
+            headers.remove(&hn);
+        }
+    }
+    let prefixed: Vec<HeaderName> = headers
+        .keys()
+        .filter(|n| {
+            let s = n.as_str();
+            s.starts_with("proxy-") || s.starts_with("x-forwarded-")
+        })
+        .cloned()
+        .collect();
+    for name in prefixed {
+        headers.remove(&name);
+    }
+
+    // 4. 规范化升级头：只允许 websocket，杜绝其他协议名透传
+    headers.insert(
+        http::header::CONNECTION,
+        HeaderValue::from_static("Upgrade"),
+    );
+    headers.insert(http::header::UPGRADE, HeaderValue::from_static("websocket"));
+}
+
+/// 清理 WebSocket 101 升级响应 headers
+///
+/// 移除 `Set-Cookie`、上游 CORS、`Server`、`X-Powered-By` 与非升级类 hop-by-hop，
+/// 保留 `Sec-WebSocket-Accept` / `Sec-WebSocket-Protocol` / `Sec-WebSocket-Extensions`，
+/// 并规范化 `Connection: Upgrade` 与 `Upgrade: websocket`。
+pub fn clean_ws_response_headers(headers: &mut http::HeaderMap) {
+    let connection_tokens: Vec<String> = headers
+        .get_all(http::header::CONNECTION)
+        .into_iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|s| {
+            s.split(',')
+                .map(|t| t.trim().to_lowercase())
+                .filter(|t| !t.is_empty() && t != "upgrade")
+        })
+        .collect();
+    for token in &connection_tokens {
+        if let Ok(name) = HeaderName::from_bytes(token.as_bytes()) {
+            headers.remove(&name);
+        }
+    }
+
+    for name in HOP_BY_HOP {
+        if *name == "connection" || *name == "upgrade" {
+            continue;
+        }
+        if let Ok(hn) = HeaderName::from_bytes(name.as_bytes()) {
+            headers.remove(&hn);
+        }
+    }
+
+    for name in RESPONSE_STRIP {
+        if let Ok(hn) = HeaderName::from_bytes(name.as_bytes()) {
+            headers.remove(&hn);
+        }
+    }
+
+    headers.insert(
+        http::header::CONNECTION,
+        HeaderValue::from_static("Upgrade"),
+    );
+    headers.insert(http::header::UPGRADE, HeaderValue::from_static("websocket"));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,5 +585,63 @@ mod tests {
         };
         let host = build_host_header(&target);
         assert_eq!(host, "example.com:8443");
+    }
+
+    #[test]
+    fn test_clean_ws_request_headers() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "connection",
+            "keep-alive, Upgrade, X-Secret-Hop".parse().unwrap(),
+        );
+        headers.insert("upgrade", "WebSocket".parse().unwrap());
+        headers.insert("x-secret-hop", "drop-me".parse().unwrap());
+        headers.insert("sec-websocket-key", "abc==".parse().unwrap());
+        headers.insert("sec-websocket-version", "13".parse().unwrap());
+        headers.insert("sec-websocket-protocol", "realtime".parse().unwrap());
+        headers.insert("authorization", "Bearer sk-123".parse().unwrap());
+        headers.insert("cookie", "sid=secret".parse().unwrap());
+        headers.insert("x-proxy-token", "tok".parse().unwrap());
+        headers.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
+        headers.insert("proxy-connection", "keep-alive".parse().unwrap());
+
+        clean_ws_request_headers(&mut headers);
+
+        assert_eq!(headers.get("connection").unwrap(), "Upgrade");
+        assert_eq!(headers.get("upgrade").unwrap(), "websocket");
+        assert_eq!(headers.get("sec-websocket-key").unwrap(), "abc==");
+        assert_eq!(headers.get("sec-websocket-version").unwrap(), "13");
+        assert_eq!(headers.get("sec-websocket-protocol").unwrap(), "realtime");
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer sk-123");
+        assert!(headers.get("x-secret-hop").is_none());
+        assert!(headers.get("cookie").is_none());
+        assert!(headers.get("x-proxy-token").is_none());
+        assert!(headers.get("x-forwarded-for").is_none());
+        assert!(headers.get("proxy-connection").is_none());
+    }
+
+    #[test]
+    fn test_clean_ws_response_headers() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("connection", "Upgrade".parse().unwrap());
+        headers.insert("upgrade", "websocket".parse().unwrap());
+        headers.insert("sec-websocket-accept", "acc==".parse().unwrap());
+        headers.insert("sec-websocket-protocol", "realtime".parse().unwrap());
+        headers.insert("set-cookie", "a=b".parse().unwrap());
+        headers.insert("server", "secret-srv".parse().unwrap());
+        headers.insert(
+            "access-control-allow-origin",
+            "https://evil".parse().unwrap(),
+        );
+
+        clean_ws_response_headers(&mut headers);
+
+        assert_eq!(headers.get("connection").unwrap(), "Upgrade");
+        assert_eq!(headers.get("upgrade").unwrap(), "websocket");
+        assert_eq!(headers.get("sec-websocket-accept").unwrap(), "acc==");
+        assert_eq!(headers.get("sec-websocket-protocol").unwrap(), "realtime");
+        assert!(headers.get("set-cookie").is_none());
+        assert!(headers.get("server").is_none());
+        assert!(headers.get("access-control-allow-origin").is_none());
     }
 }
