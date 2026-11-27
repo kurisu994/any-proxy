@@ -26,15 +26,8 @@
 
 ## 待办
 
-- [ ] **首次发布 v0.1.0** — 发布流水线已就位但从未跑过，镜像尚不存在。
-  ```bash
-  git tag v0.1.0 && git push origin v0.1.0
-  ```
-  - 发布后需在 GitHub package 设置里把可见性改为 **Public**，否则匿名 `docker pull` 失败。
-  - 在此之前 `docker-compose.caddy.yml` 默认引用的 `ghcr.io/kurisu994/any-proxy:0.1.0` 拉不到，
-    需用 `ANY_PROXY_IMAGE=any-proxy:dev` 配合本地 `docker build` 使用。
-  - ⚠️ `release.yml` 为首次运行，留意 `ubuntu-24.04-arm` runner 能否正常调度。
-  - 自用定位下这件事仍然值得做：省掉在小内存 VPS 上编译 Rust（容易直接 OOM）。
+- [x] **首次发布 v0.1.0** — `v0.1.0` tag 已在 `51d472d` 发布，双推 Docker Hub（`kurisu003/any-proxy:0.1.0`）与 GHCR（`ghcr.io/kurisu994/any-proxy:0.1.0`）。
+  - 保留提醒：确认 Docker Hub 与 GitHub Packages 可见性均为 **Public**，否则匿名 `docker pull` 失败；跑本地未发布改动时仍可用 `ANY_PROXY_IMAGE=any-proxy:dev` 配合本地 `docker build`。
 
 - [ ] **（P3）rustls-pemfile 未维护告警** — `RUSTSEC-2025-0134`，仅 informational，无漏洞。
   - 它是 `rustls-native-certs v0.7.3` 的传递依赖（N9 已删除直接依赖），需升级上游才能消除。

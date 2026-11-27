@@ -2,11 +2,12 @@
 
 ## 项目结构与模块组织
 
-本仓库是 Rust 2021 edition 的单 crate 项目，最低支持 Rust 1.75。M1 已实现完整 Relay，包含 library target 和 binary target，可通过 `cargo run` 启动代理服务。
+本仓库是 Rust 2021 edition 的单 crate 项目，最低支持 Rust 1.86（MSRV，由 CI 锁定）。M1 已实现完整 Relay，包含 library target 和 binary target，可通过 `cargo run` 启动代理服务。
 
-- `src/main.rs`：进程入口、配置加载、宿主接口刷新调度与 SIGTERM 优雅关闭。
+- `src/main.rs`：进程入口、配置加载、启动 gate、`health-check` 子命令、宿主接口刷新调度与 SIGTERM 优雅关闭。
 - `src/app.rs`：Axum Router 组装。
 - `src/concurrency.rs`：进程级并发上限；permit 挂在响应 Body 上，流结束才释放，饱和时返回 503。
+- `src/budget.rs`：全局出口字节预算与令牌桶限速（C1 批次 2）。
 - `src/body_timeout.rs`：逐 frame idle timeout 的 Body 包装，防止慢速流长期占用连接。
 - `src/proxy.rs`：核心代理编排，集成 Connector、重定向状态机与流式 Body 桥接。
 - `src/config.rs`：环境变量解析、校验与 typed Config。
@@ -17,14 +18,20 @@
 - `src/resolver.rs`：DNS 解析、fail-closed 公网地址策略和连接地址固定。
 - `src/connector.rs`：在一次调用中完成 resolve、全量校验、dial 和 TLS 握手。
 - `src/redirect.rs`：重定向状态机、降级拦截与逐跳复查。
-- `tests/`：本地 HTTP/HTTPS fixture、Connector 集成测试、TLS spike、M1 端到端 relay 测试和并发/流生命周期回归测试。
-- `Dockerfile`、`docker-compose.yml`：多阶段构建与单容器部署。
+- `tests/`：本地 HTTP/HTTPS fixture、Connector 集成测试、TLS spike、M1 端到端 relay 测试、并发/流生命周期回归测试和流式内存上界回归测试（`streaming_memory.rs`）。
+- `Dockerfile`、`docker-compose.yml`、`docker-compose.caddy.yml`、`Caddyfile`、`deploy.sh`：多阶段构建、单容器与 Caddy 公网 HTTPS 一键部署。
 - `DESIGN.md`：**当前**安全模型、模块边界、资源边界与错误契约，含已知偏差清单；涉及行为调整前应先核对这里的约束。它只描述已实现的行为，不写承诺。
 - `docs/adr/0001-any-proxy-relay-design.md`：立项时的设计推演与备选方案，历史快照，不再维护。其中若干 premise 已被实现推翻，不要据此判断当前行为。
-- `TODOS.md`：待办与优先级排序（资源边界 → 安全边界 → 产品真实性 → 部署体验）。
-- `.github/workflows/ci.yml`：合并门槛，以 `fmt + clippy + test` 为准。
+- `TODOS.md`：项目定位拍板、待办与按定位关闭清单。
+- `.github/workflows/ci.yml`、`.github/workflows/release.yml`：CI 合并门槛（`fmt + clippy + test + MSRV + cargo-audit + 容器冒烟`）与多架构双源镜像发布流水线。
+- `memory-bank/`：项目长期记忆与分领域规范（四层结构：共识层 `00-project.md` / `1X-*.md`、活跃任务 `active/`、个人日志 `journal/`、历史归档 `archive/`），入口与写作约定见 [memory-bank/README.md](memory-bank/README.md)。
 
 新增代码应放入职责最接近的现有模块。只有形成独立安全边界或清晰领域职责时才新增模块，并在 `src/lib.rs` 暴露必要 API。
+
+## 记忆银行协作
+
+- 入口文档与路径映射表见 `memory-bank/README.md`；新会话开局先读 `memory-bank/00-project.md`，接触源码时各领域规范（`1X-*.md`）由 hook 按 `paths` 自动注入。
+- 会话收尾按 `memory-bank/README.md` 的「写入门槛」决定是否更新：仅记录值得跨会话保留的实质进展、重要决策、可复用结论或未解决阻塞；纯查询或无新结论的例行检查不改动记忆文件，且写入个人日志前须按「个人日志归属」核实身份。
 
 ## 构建、测试与开发命令
 
@@ -41,11 +48,13 @@ cargo run --release
 - `cargo build`：编译 library、binary 和依赖，适合完成一组修改后的快速验证。
 - `cargo fmt --check`：检查 Rustfmt 格式，不修改文件；需要修复时运行 `cargo fmt`。
 - `cargo clippy --all-targets -- -D warnings`：运行静态检查；CI 已加 `--all-targets`，测试代码的 lint 同样会被拦截。
-- `cargo test`：运行全部测试，当前共 140 个（其中 1 个默认 ignore 的 35 秒长传输回归，用 `cargo test --test concurrency -- --ignored` 手动跑）。
+- `cargo test`：运行全部测试，当前共 175 个（默认运行通过 174 个，另有 1 个默认 ignore 的 35 秒长传输回归，用 `cargo test --test concurrency -- --ignored` 手动跑）。
 - `cargo test <test_name>`：只运行指定测试，适合开发时快速反馈。
 - `cargo test --test integration`：只运行 Connector 集成测试。
 - `cargo test --test tls_spike`：只运行 TLS fixture 测试。
 - `cargo test --test relay`：只运行 M1 端到端集成测试。
+- `cargo test --test concurrency`：只运行并发上限与流生命周期回归测试。
+- `cargo test --test streaming_memory`：只运行 256 MiB 流式内存上界回归测试。
 - `cargo run --release`：启动代理服务，默认监听 `0.0.0.0:8080`。
 - `LISTEN_ADDR=127.0.0.1:9090 cargo run --release`：指定监听地址启动。
 

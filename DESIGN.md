@@ -8,7 +8,7 @@
 > 立项时的设计推演、备选方案与原始 premises 已归档为
 > [docs/adr/0001-any-proxy-relay-design.md](docs/adr/0001-any-proxy-relay-design.md)（历史快照，不再维护）。
 >
-> 最后校准：2026-07-24（对照代码逐条核验）
+> 最后校准：2026-11-27（对照代码逐条核验）
 
 ---
 
@@ -31,8 +31,8 @@ https://proxy.example.com/https://api.example.com/data?city=shanghai
 | 里程碑 | 状态 |
 |--------|------|
 | M0 安全连接器 | ✅ 完成 |
-| M1 完整 Relay | ✅ 完成（存在已知偏差，见 §10） |
-| M2 发布供应链 | 待做 |
+| M1 完整 Relay | ✅ 完成（核心偏差已清零，保留项见 §10） |
+| M2 发布供应链 | ✅ 收敛（多架构双源镜像 + CI 容器冒烟 + Caddy/`deploy.sh` 已就位，SBOM/provenance/Prometheus 按自用定位关闭） |
 
 **交付状态：`DONE_WITH_CONCERNS`。** 默认公网匿名、无调用方额度的风险没有技术消除。
 
@@ -72,9 +72,10 @@ https://proxy.example.com/https://api.example.com/data?city=shanghai
 
 | 模块 | 职责 |
 |------|------|
-| `main.rs` | 进程入口、配置加载、宿主接口刷新调度、`health-check` 子命令、SIGTERM 关闭 |
+| `main.rs` | 进程入口、配置加载、启动 gate、宿主接口刷新调度、`health-check` 子命令、SIGTERM 关闭 |
 | `app.rs` | Axum Router 组装 |
 | `concurrency.rs` | 进程级并发上限，permit 生命周期绑定到响应流结束 |
+| `budget.rs` | 全局出口字节预算与令牌桶限速（C1 批次 2） |
 | `proxy.rs` | 核心编排 |
 | `config.rs` | 环境变量解析与校验 |
 | `headers.rs` | 请求/响应 header 清理、CORS 预检与响应头 |
@@ -150,12 +151,11 @@ deny 列表覆盖：私网、链路本地（含云元数据 `169.254.169.254`）
 - `Access-Control-Allow-Methods` 固定；`Access-Control-Allow-Headers` 回显通过校验的请求 header 名。
 - 不转发浏览器 `Cookie`，不返回目标 `Set-Cookie`。
 - 允许转发 `Authorization`，跨 origin 重定向时删除。
-- 所有代理生成的错误响应都带 CORS headers（`/healthz` 除外，见 TODOS N14）。
+- 所有代理生成的响应（含错误响应、`/` 首页与 `/healthz` 健康检查）都带 CORS headers。
 
-请求与响应都先解析 `Connection` header 的逗号分隔 token 并删除其中点名的 headers，再删除固定 hop-by-hop 集合。请求侧额外移除 `Host`、`Forwarded`、`Via`、`X-Forwarded-*`、`Cookie`；响应侧额外移除 `Set-Cookie`、上游 CORS headers、`Server`、`X-Powered-By`。
+请求与响应都先解析 `Connection` header 的逗号分隔 token 并删除其中点名的 headers，再删除固定 hop-by-hop 集合。请求侧额外移除 `Host`、`Forwarded`、`Via`、`X-Real-IP`、`Cookie`、`X-Proxy-Request-Id`、`X-Proxy-Token`，并通配清理 `Proxy-*` 与 `X-Forwarded-*` 前缀；响应侧额外移除 `Set-Cookie`、上游 CORS headers、`Server`、`X-Powered-By`，保留上游 `Vary` 并追加 CORS 缓存维度。
 
-> ⚠️ 两处已知偏差：`Proxy-Connection` 等前缀未被通配清理（TODOS E9）；
-> **trailer frame 完全绕过上述清理**（TODOS M2）。
+**Trailer 策略**：流式 Body 层直接丢弃所有 trailer frame，杜绝 `Set-Cookie` / `Cookie` / CORS 借 trailer 绕过上述清理（覆盖于 `body_timeout::test_trailer_frame_dropped`）。
 
 ## 7. 流式传输与资源边界
 

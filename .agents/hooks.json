@@ -1,0 +1,30 @@
+{
+  "memory-bank": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "python3 -X utf8 ./hooks/inject-memory-bank.py",
+        "timeout": 10
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "read_file|edit_file|write_file|view_file|write_to_file|replace_file_content|multi_replace_file_content",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -X utf8 ./hooks/inject-memory-bank.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "python3 -X utf8 ./hooks/inject-memory-bank.py",
+        "timeout": 10
+      }
+    ]
+  }
+}
