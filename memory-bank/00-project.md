@@ -2,7 +2,7 @@
 
 ## 项目定位
 
-`any-proxy`（`https://github.com/kurisu994/any-proxy`）是开源、自托管的 URL 前缀式 HTTP(S) CORS Relay，使用 Rust 2021 edition 单 crate 实现（含 `lib` 与 `bin` target），当前版本 `0.1.0`，MSRV Rust `1.86`，MIT 协议。
+`any-proxy`（`https://github.com/kurisu994/any-proxy`）是开源、自托管的 URL 前缀式 HTTP(S) CORS Relay，使用 Rust 2021 edition 单 crate 实现（含 `lib` 与 `bin` target），当前版本 `0.2.0`，MSRV Rust `1.86`，MIT 协议。
 
 使用者将目标绝对 URL 直接拼在代理地址之后，请求从部署服务器出口发出，代理清理敏感头并补充统一 CORS 响应头，使浏览器可跨域读取结果：
 

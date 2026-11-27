@@ -45,13 +45,13 @@ CI 在打 SemVer tag 时构建 `linux/amd64` + `linux/arm64` 多架构镜像，�
 ```bash
 docker run --rm -p 8080:8080 \
   -e ALLOW_TARGETS=api.github.com \
-  kurisu003/any-proxy:0.1.0
+  kurisu003/any-proxy:0.2.0
 ```
 
 备用镜像源（拉取困难时换用）：
 
 ```bash
-docker pull ghcr.io/kurisu994/any-proxy:0.1.0
+docker pull ghcr.io/kurisu994/any-proxy:0.2.0
 ```
 
 版本请固定，不要用 `latest`——tag 可被覆盖，只有固定版本（或 digest）才能保证「重建即同一份产物」。要求更强时按 digest 固定：
@@ -92,7 +92,7 @@ docker run -d -p 8080:8080 any-proxy
 
 ```bash
 curl http://localhost:8080/healthz
-# {"status":"ok","version":"0.1.0"}
+# {"status":"ok","version":"0.2.0"}
 ```
 
 ### 公网 HTTPS（Caddy 自动 TLS）

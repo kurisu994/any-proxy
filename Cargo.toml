@@ -1,6 +1,6 @@
 [package]
 name = "any-proxy"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.86"
 description = "Rust 公网匿名 CORS Relay — URL 前缀式 HTTP(S) 代理"

@@ -21,7 +21,7 @@
 #   MAX_EGRESS_BYTES   进程累计出口字节上限（默认 10 GiB，重启重置）
 #   AUTH_TOKEN         设置后请求需带 X-Proxy-Token
 #   PUBLIC_MODE        显式确认公网匿名开放；无任何访问控制时脚本会自动置 1
-#   ANY_PROXY_IMAGE    覆盖镜像（默认 kurisu003/any-proxy:0.1.0）
+#   ANY_PROXY_IMAGE    覆盖镜像（默认 kurisu003/any-proxy:0.2.0）
 #   UPSTREAM_HEADERS_TIMEOUT   等待上游响应头超时（默认 180s）
 #   UPSTREAM_BODY_IDLE_TIMEOUT 下载逐帧空闲超时（默认 180s）
 #   ALLOW_WEBSOCKET            是否允许 WebSocket 升级（默认 true）
@@ -31,8 +31,8 @@
 #   SKIP_DNS_CHECK=1   跳过 DNS 指向检查
 set -euo pipefail
 
-IMAGE_DEFAULT="kurisu003/any-proxy:0.1.0"
-IMAGE_FALLBACK="ghcr.io/kurisu994/any-proxy:0.1.0"
+IMAGE_DEFAULT="kurisu003/any-proxy:0.2.0"
+IMAGE_FALLBACK="ghcr.io/kurisu994/any-proxy:0.2.0"
 
 red()  { printf '\033[31m%s\033[0m\n' "$*"; }
 grn()  { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -238,7 +238,7 @@ services:
       - any-proxy
 
   any-proxy:
-    image: ${ANY_PROXY_IMAGE:-kurisu003/any-proxy:0.1.0}
+    image: ${ANY_PROXY_IMAGE:-kurisu003/any-proxy:0.2.0}
     restart: unless-stopped
     # 不映射宿主端口：只在内部网络可达，公网入口只有 Caddy
     expose:
